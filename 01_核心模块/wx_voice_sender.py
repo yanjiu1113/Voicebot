@@ -238,11 +238,39 @@ REC_GREEN_MIN = 800         # 绿色像素数超过此值视为"正在录制"
 TOOLBAR_Y_RATIO = 0.88      # 工具栏区起始 y 比例
 
 # 时序(秒)
-T_RECORD_SETTLE = 0.8       # 点录音后等待录音真正启动(用于状态检测)
+T_RECORD_SETTLE = 3.0       # ★ 轮询"是否已进入录音态"的**预算上限**
+                            #   ⚠️ 不能调小!实测微信录音工具栏变绿有
+                            #   **1.6~2.2 秒延迟**。预算不足会误判成"没进入录音",
+                            #   进而补点语音条按钮 —— 而补点会把刚开始的录音
+                            #   **直接取消掉**(实测:补点后 0.55 秒录音态消失)。
+                            #   检测快时不会等满,所以留大没有代价。
+T_REC_POLL = 0.12           # 轮询间隔
+T_REC_CONFIRM = 0.8         # (保留)补点前的确认观察时长
+REC_VERIFY_WINDOW = 2.5     # 播放后确认录音态的观察窗口
+                            # 绿色工具栏有 1~2 秒延迟,单次采样会误判
 T_REC_SETTLE_AFTER = 0.7    # 确认进入录音态后,再等这么久才播放
                             # 实测:立刻播放会让开头一段丢失
+                            # ⚠️ 这一条**不能随便调小** —— 微信的录音管线
+                            #    需要时间真正开始取音,提前播放会吃掉字头。
+                            #    (想缩短语音条时长,应该从别处省,不要动这里)
 T_TAIL = 0.5                # 播完后留的尾巴(避免截断;太长会变成尾部静音)
+T_TAIL_COMPACT = 0.35       # 紧凑模式下的尾巴
 T_AFTER_SEND = 2.0
+
+# ---------------------------------------------------------------------------
+# 诊断开关
+#
+# ★ 微信的录音是"从点语音条按钮开始,到点发送结束",中间本程序做的每一件
+#   事(等待、截图、状态检测)都会被录进去,变成语音条**首尾的静音**。
+#   所以默认走**紧凑模式**:不做诊断截图、用轮询代替固定等待。
+#   排查问题时加 --debug(或把 DEBUG_DIAG 改 True)恢复完整诊断。
+# ---------------------------------------------------------------------------
+DEBUG_DIAG = False
+
+
+def _is_debug(debug=None):
+    return DEBUG_DIAG if debug is None else bool(debug)
+
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +404,28 @@ def is_recording(hwnd, verbose=False):
     return n >= REC_GREEN_MIN, n
 
 
+def wait_recording(hwnd, timeout=None, interval=T_REC_POLL, verbose=False):
+    """轮询等待"进入录音态",一检测到就立刻返回。
+
+    为什么不用固定 sleep:
+        固定 T_RECORD_SETTLE=0.8 秒意味着**每次都要等满 0.8 秒**,
+        而这段时间微信在录音 —— 直接变成语音条开头的静音。
+        实测通常 0.2~0.3 秒就已经进入录音态了。
+
+    Returns: (是否进入录音, 绿色像素数, 实际等待秒数)
+    """
+    if timeout is None:
+        timeout = T_RECORD_SETTLE
+    t0 = time.time()
+    rec, g = is_recording(hwnd, verbose=False)
+    while not rec and (time.time() - t0) < timeout:
+        time.sleep(interval)
+        rec, g = is_recording(hwnd, verbose=False)
+    if verbose:
+        print("       [录制检测] 绿色像素 = %d,用时 %.2fs" % (g, time.time() - t0))
+    return rec, g, time.time() - t0
+
+
 # ---------------------------------------------------------------------------
 # 音频
 # ---------------------------------------------------------------------------
@@ -456,11 +506,56 @@ def load_for_cable(wav_path, trim_silence=True, verbose=False):
     return np.repeat(a.reshape(-1, 1), 2, axis=1), len(a) / float(CABLE_RATE), info
 
 
-def play_to_cable(stereo, record_to=None):
+def open_cable_stream(verbose=False):
+    """提前打开线缆播放流。
+
+    ★ 为什么要提前开:
+        WASAPI 打开 VoiceMeeter 播放端要 **约 0.7 秒**。如果等到该播放时
+        才开,这 0.7 秒微信已经在录音了 —— 直接变成语音条开头的静音。
+        在**点录音按钮之前**开好,播放时就没有这段延迟。
+
+    返回流对象(失败返回 None,调用方回退到普通播放)。
+    """
+    import sounddevice as sd
+    try:
+        play_idx, _rec_idx, info = _find_cable_devices()
+        rate = info.get("rate") or CABLE_RATE
+        if play_idx is None:
+            return None
+        s = sd.OutputStream(device=play_idx, samplerate=rate,
+                            channels=2, dtype="int16")
+        s.start()
+        if verbose:
+            print("       [音频] 已预开线缆播放流(设备 %s @ %dHz)" % (play_idx, rate))
+        return s
+    except Exception as e:
+        if verbose:
+            print("       [音频] 预开播放流失败(%s),回退普通播放" % str(e)[:50])
+        return None
+
+
+def close_cable_stream(stream):
+    if stream is None:
+        return
+    try:
+        stream.stop()
+    except Exception:
+        pass
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
+def play_to_cable(stereo, record_to=None, stream=None):
     """把音频播到虚拟线缆的播放端。
 
     record_to: 若给出路径,则**同时从录音端采集**,把线缆上
                实际流过的信号存成 WAV —— 用于诊断"微信到底录到了什么"。
+               ⚠️ 它会占用微信正在用的录音端点,实测会让录音中断,
+                  所以只有 debug 排查时才用。
+    stream:    预先打开的播放流(见 open_cable_stream)。给了就直接写,
+               省掉 ~0.7 秒的设备打开时间。
     """
     import sounddevice as sd
     import numpy as np
@@ -472,6 +567,9 @@ def play_to_cable(stereo, record_to=None):
         raise RuntimeError("找不到 VoiceMeeter 播放端设备")
 
     if not record_to or rec_idx is None:
+        if stream is not None:
+            stream.write(stereo)
+            return None
         with sd.OutputStream(device=play_idx, samplerate=rate,
                              channels=2, dtype="int16") as o:
             o.write(stereo)
@@ -510,7 +608,7 @@ def play_to_cable(stereo, record_to=None):
 def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
                       verbose=True, snapshot_prefix=None, expect_name=None,
                       wait_tts_ready=True, tts_wait=180,
-                      diag_record=None, rec_settle=None):
+                      diag_record=None, rec_settle=None, debug=None):
     """向会话列表第 row_index 行(0 起)发送一条语音条。
 
     Args:
@@ -527,12 +625,16 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
                      不确定时设为 False 更保险;默认取 DIAG_RECORD。
         rec_settle: 点录音按钮后、开始播放前等待的秒数。
                     微信需要时间真正启动录音;太短会漏掉开头。
+        debug: True = 完整诊断模式(每步存截图、播放时同步采集线缆)。
+               默认取 DEBUG_DIAG(False),即**紧凑模式** ——
+               微信会把本程序等待/截图的时间也录成首尾静音,
+               紧凑模式能显著缩短语音条时长。
         keep_wav: 是否保留合成的 WAV
         verbose: 打印过程
 
     Returns:
         dict: {"ok": bool, "wav": path, "duration": float, "error": str|None,
-               "session": 会话判定结果}
+               "session": 会话判定结果, "step": 失败时卡在哪一步}
     """
     ws = _import_sender()
     import gptsovits_tts as tts
@@ -541,6 +643,8 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
     res = {"ok": False, "wav": None, "duration": None, "error": None,
            "step": "开始"}
     _t0 = time.time()
+    _dbg = _is_debug(debug)
+    res["debug"] = _dbg
 
     def log(*a):
         if verbose:
@@ -552,6 +656,8 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         res["step_elapsed"] = round(time.time() - _t0, 1)
         if note:
             res["step_note"] = note
+        if verbose:
+            print("       [计时] %-16s 累计 %.2fs" % (step, time.time() - _t0))
         return step
 
     # 0. 前置检查:微信窗口必须存在、而且能拉到最前面。
@@ -675,6 +781,12 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
     vx, vy = anchor_pos(hwnd, "voice_btn")
     log("       坐标 (%d,%d)" % (vx, vy))
 
+    # 3z. ★ 在点录音按钮**之前**就把线缆播放流开好。
+    #     WASAPI 打开 VoiceMeeter 播放端要 ~0.7 秒;若等到该播放时才开,
+    #     这 0.7 秒微信已经在录音 -> 变成语音条开头的静音。
+    _diag = DIAG_RECORD if diag_record is None else bool(diag_record)
+    _pre_stream = None if _diag else open_cable_stream(verbose=verbose)
+
     # 3a. 关键前置检查:微信必须在最前面,且按钮坐标必须真的属于微信。
     #     ★ 用户实测坑:微信被别的窗口(浏览器/控制面板)盖住时,
     #       盲点绝对坐标会把点击送到**盖在上面的那个程序**上,
@@ -693,6 +805,7 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         log("   ✗ " + res["error"])
         if snapshot_prefix:
             _snap(hwnd, "%s_fail_blocked.png" % snapshot_prefix)
+        close_cable_stream(_pre_stream)
         return res
 
     ok_click = ws.click(vx, vy, expect_hwnd=hwnd)
@@ -704,55 +817,57 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         except Exception:
             pass
         ws.click(vx, vy, expect_hwnd=hwnd)
-    time.sleep(T_RECORD_SETTLE)
 
     # 3b. 确认真的进入录音态(避免后面点了"发送"却发不出去)
-    rec, gcount = is_recording(hwnd, verbose=verbose)
-    if not rec:
-        log("       ⚠ 未检测到录音状态(绿色像素=%d),重试一次" % gcount)
-        ws.click(vx, vy, expect_hwnd=hwnd)
-        time.sleep(T_RECORD_SETTLE + 0.4)
-        rec, gcount = is_recording(hwnd, verbose=verbose)
-    if not rec:
-        res["error"] = ("进入录音失败(绿色像素=%d)—— 语音条按钮没点中或点击没送到微信"
-                        % gcount)
-        log("   ✗ " + res["error"])
-        if snapshot_prefix:
-            _snap(hwnd, "%s_fail_norecord.png" % snapshot_prefix)
-        # 尝试取消,避免残留在录音态
-        try:
-            cx, cy = anchor_pos(hwnd, "cancel_btn")
-            ws.click(cx, cy, expect_hwnd=hwnd)
-        except Exception:
-            pass
-        return res
-    log("       ✅ 已进入录音状态(绿色像素=%d)" % gcount)
-
-    # ★ 一进入录音就截图:这样万一后面失败,也能看到当时的真实工具栏,
-    #   而不是只有一个"打开会话"的截图(以前就是这样,查不出失败原因)。
-    if snapshot_prefix:
-        _snap(hwnd, "%s_recording_start.png" % snapshot_prefix)
-
-
-    # 3c. 再等一会儿,确保微信的录音管线真正开始取音
-    #     实测:点完按钮立刻播放,开头一段会被漏掉。
+    #
+    # ⚠️⚠️ 这里是本项目最凶的坑,用户的"没有发送点击 / 没录上语音"就是它:
+    #     微信的"录音工具栏变绿"有 **约 1.6 秒延迟**。
+    #     如果轮询预算设短了(旧值 0.8 秒),就会误判成"没进入录音",
+    #     然后**再点一次语音条按钮** —— 而这次补点会把刚刚开始的录音
+    #     **直接取消掉**。实测:
+    #         第1次 click -> 1.1 秒后 录音=True (其实已经录上了)
+    #         第2次 click -> 0.55 秒后 录音=False(被自己点没了)
+    #     于是表现就是:鼠标停在语音条按钮上不动、没有发送点击、
+    #     微信里也没有录到语音。
+    #
+    # ★ 所以这里**不再"等绿色工具栏出现"再播放**:
+    #     绿色出现要 1.0~2.3 秒(时快时慢),而这段时间录音已经在跑,
+    #     等它就是白白往语音条开头塞静音。
+    #   改成:先固定等 T_REC_SETTLE_AFTER 让录音管线就绪(实测够用),
+    #         立刻播放;"到底有没有录上"放到播放之后判定(见 [4b]),
+    #         失败时先取消 → 再安全重试一次。
     if rec_settle is None:
         rec_settle = T_REC_SETTLE_AFTER
     if rec_settle > 0:
         log("       等待录音管线就绪 %.2fs" % rec_settle)
         time.sleep(rec_settle)
 
+    # 只瞄一眼做提示(仅 debug;每次采样要 0.25 秒,录音正在跑)
+    if _dbg:
+        _peek, _pg = is_recording(hwnd, verbose=verbose)
+        if not _peek:
+            log("       (绿色工具栏还没出现 —— 正常,它本身有 1~2 秒延迟)")
+
+    # ★ 诊断截图:**只在 debug 模式**做(PrintWindow 会占 0.3~0.4 秒)
+    if _dbg and snapshot_prefix:
+        _snap(hwnd, "%s_recording_start.png" % snapshot_prefix)
+
     # 4. 播放(可选同步录音,便于诊断)
     mark("4-播放音频")
     log("[4/5] 播放到虚拟线缆 …")
     diag_path = None
-    _diag = DIAG_RECORD if diag_record is None else bool(diag_record)
+    # ⚠️ 注意:诊断录音**不跟随 debug** ——
+    #    play_to_cable 一旦要录音,就会打开 sd.InputStream(线缆录音端点),
+    #    而那正是微信正在用的录音端点。实测后果:
+    #        播放期间微信录音直接中断 -> "播放后录音已中断"
+    #    所以它必须独立开关,而且默认关闭。真要抓线缆信号请显式传
+    #    diag_record=True(会牺牲发送成功率,只用于排查"是不是没声音")。
     if _diag and snapshot_prefix:
         diag_path = "%s_cable.wav" % snapshot_prefix
     elif not _diag:
         log("       (已关闭诊断录音 —— 避免与微信抢录音设备)")
     try:
-        info = play_to_cable(stereo, record_to=diag_path)
+        info = play_to_cable(stereo, record_to=diag_path, stream=_pre_stream)
         if info:
             res["cable_probe"] = info
             log("       实采信号: RMS=%.0f 峰值=%d 时长=%.2fs" % (
@@ -770,20 +885,56 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
             ws.click(cx, cy, expect_hwnd=hwnd)
         except Exception:
             pass
+        close_cable_stream(_pre_stream)
         return res
-    time.sleep(T_TAIL)
+    close_cable_stream(_pre_stream)
+    _pre_stream = None
+    time.sleep(T_TAIL if _dbg else T_TAIL_COMPACT)
 
-    # 4b. 发送前再确认仍在录音态
-    still, g2 = is_recording(hwnd, verbose=verbose)
+    # 4b. 播放后再确认"确实在录音"
+    #
+    # ⚠️ 不能用单次采样就判定失败 —— 绿色工具栏本身有 1~2 秒延迟,
+    #    单次采样正是旧代码的误判来源。这里给它一段观察窗口。
+    still, g2, _w = wait_recording(hwnd, timeout=REC_VERIFY_WINDOW, verbose=verbose)
+
     if not still:
-        res["error"] = "播放后录音已中断(绿色像素=%d),取消发送" % g2
+        # 播放完了却没录上 —— 最可能是语音条按钮那一下被吞了。
+        # 此刻已确认**不在录音态**,所以补点不会误伤正在进行的录音,
+        # 可以安全地重试一次(补点 + 重播)。
+        log("       ⚠ 未确认到录音(绿色像素=%d),补点语音条按钮并重播一次" % g2)
+        if snapshot_prefix:
+            _snap(hwnd, "%s_retry_norecord.png" % snapshot_prefix)
+        try:
+            ws.bring_to_front(hwnd)
+        except Exception:
+            pass
+        ws.click(vx, vy, expect_hwnd=hwnd)
+        time.sleep(T_REC_SETTLE_AFTER)
+        try:
+            play_to_cable(stereo, record_to=None)
+        except Exception as e:
+            log("       ⚠ 重播失败: %s" % str(e)[:60])
+        time.sleep(T_TAIL if _dbg else T_TAIL_COMPACT)
+        still, g2, _w = wait_recording(hwnd, timeout=REC_VERIFY_WINDOW,
+                                       verbose=verbose)
+        res["retried"] = True
+
+    if not still:
+        res["error"] = ("播放后仍未录上(绿色像素=%d)—— 语音条按钮没点中或点击没送到微信。"
+                        "请确认微信窗口在最前面且已最大化。" % g2)
         log("   ✗ " + res["error"])
         if snapshot_prefix:
             _snap(hwnd, "%s_fail_recbroken.png" % snapshot_prefix)
+        # 取消,避免留下一条长录音
+        try:
+            cx, cy = anchor_pos(hwnd, "cancel_btn")
+            ws.click(cx, cy, expect_hwnd=hwnd)
+        except Exception:
+            pass
         return res
+    log("       ✅ 已确认在录音态(绿色像素=%d)" % g2)
     # 注意:这里**不再**截图。PrintWindow 要 0.3s 左右,而录音还在继续,
-    #       这段等待会变成语音条**结尾的静音**(实测能让 6 秒的话显示成 12 秒)。
-    #       诊断截图已经在刚进入录音时拍过(_recording_start.png)。
+    #       这段等待会变成语音条**结尾的静音**。
 
     # 5. 发送
     #

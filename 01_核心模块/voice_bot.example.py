@@ -196,6 +196,11 @@ CHATS = {
 POLL_INTERVAL = 3.0      # 轮询间隔(秒)
 MAX_REPLY_CHARS = 60     # 超过此长度不转语音(语音条不适合太长)
 SEND_TEXT_TOO = False    # 是否同时发一条文字(False = 只发语音条)
+# 诊断模式(由 --debug 打开):
+#   True  = 每步存截图 + 播放时同步采集线缆,排查问题用
+#   False = 紧凑模式(默认)—— 微信会把等待/截图时间也录进语音条,
+#           关掉诊断能明显缩短语音条首尾的静音
+DEBUG_MODE = False
 SNAPSHOT_DIR = os.path.join(ROOT, "05_文档", "发送截图")
 LOG_DIR = os.path.join(ROOT, "05_文档", "运行日志")
 
@@ -551,15 +556,18 @@ def verify_chat_open(name):
         return None
 
 
-def send_voice(chat_key, text, row, expect_name=None):
+def send_voice(chat_key, text, row, expect_name=None, debug=False):
     """向指定会话行发送语音条。
 
     expect_name 会用于 OCR 标题校验 —— 防止因行号漂移而发错人,
     并避免对已打开的会话重复点击(微信会 toggle 关闭)。
+
+    debug=True 时打开完整诊断(每步截图 + 播放时同步采集线缆),
+    会明显拉长语音条首尾静音,只在排查问题时用。
     """
     print("  [发送] 目标「%s」第 %d 行 -> %s" % (expect_name or "?", row, text))
     res = vS.send_voice_by_row(
-        text, row, verbose=True, expect_name=expect_name,
+        text, row, verbose=True, expect_name=expect_name, debug=debug,
         snapshot_prefix=os.path.join(SNAPSHOT_DIR, chat_key[:12]))
     if res.get("ok"):
         g = res.get("session") or {}
@@ -627,7 +635,8 @@ def run_once(db, state, live):
                 continue
 
             if live:
-                r = send_voice(chat_key, voice_text, cfg["row"], expect_name=name)
+                r = send_voice(chat_key, voice_text, cfg["row"], expect_name=name,
+                               debug=DEBUG_MODE)
                 if r.get("ok"):
                     print("  ✅ 语音条已发送")
                     _sent_counter["n"] += 1
@@ -725,14 +734,21 @@ def main():
                     help="列出所有会话与行号(用于填写 CHATS)")
     ap.add_argument("--reset", action="store_true",
                     help="清空水位记录(下次会重新处理最近消息)")
+    ap.add_argument("--debug", action="store_true",
+                    help="诊断模式:每步存截图 + 播放时同步采集线缆。"
+                         "排查问题用;平时不用(会拉长语音条首尾静音)")
     args = ap.parse_args()
+
+    global DEBUG_MODE
+    DEBUG_MODE = bool(args.debug)
 
     # 开始记录日志(所有 print 会同时写入 05_文档\运行日志\)
     _lp = start_logging()
 
     print("=" * 74)
     print("  微信语音自动回复")
-    print("  模式: %s" % ("【实际发送】" if args.live else "【DRY-RUN 只演练】"))
+    print("  模式: %s%s" % ("【实际发送】" if args.live else "【DRY-RUN 只演练】",
+                            "  + 诊断模式(--debug)" if DEBUG_MODE else ""))
     print("=" * 74)
     if _lp:
         print("  运行日志: %s" % _lp)
