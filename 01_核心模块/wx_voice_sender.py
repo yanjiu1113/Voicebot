@@ -26,6 +26,7 @@ wx_voice_sender.py —— 通过「桌面微信 + 虚拟声卡」发送 GPT-SoVI
 """
 
 import ctypes
+import json
 import os
 import sys
 import time
@@ -185,11 +186,52 @@ RATIO_SESSION_DY = 0.0435   # 行间距 —— 实测 67/1540 ≈ 0.0435
 #     录音发送⬆   距右  86, 距下 76
 #     录音取消✕   距右 440, 距下 76
 # ---------------------------------------------------------------------------
-ANCHOR = {
-    "voice_btn": (223, 73),     # (距右, 距下) 语音条按钮 -> 实测 (2349,1455)
-    "send_btn":  (86, 76),      # (距右, 距下) 录音中的 ⬆ 发送 -> 实测 (2486,1452)
-    "cancel_btn": (440, 76),    # (距右, 距下) 录音中的 ✕ 取消 -> 实测 (2132,1452)
+# ---------------------------------------------------------------------------
+# 按钮坐标
+#
+# ⚠️ 教训:之前用"距右/下边缘偏移"推算,但基准窗口尺寸一旦不同就会整体偏移。
+#    实测偏差 12 像素就足以点空(按钮很小)。
+#    所以这里改为:
+#      · 以**用户实测的绝对坐标**为基准(最可靠);
+#      · 记录测量时的窗口尺寸;
+#      · 若实际窗口尺寸不同,按比例换算(并用边缘偏移兜底)。
+# ---------------------------------------------------------------------------
+BUTTONS_MEASURED = {
+    # 用户用「采集按钮坐标.py」实测(窗口最大化时)
+    "voice_btn": (2347, 1450),   # 语音条按钮(点它开始录音)
+    "send_btn": (2483, 1443),    # 录音中的 ⬆ 发送
+    "cancel_btn": (2129, 1444),  # 录音中的 ✕ 取消
 }
+# 测量时的窗口(原点与尺寸)。用户测量时窗口最大化。
+MEASURED_WINDOW = {"x": -12, "y": -12, "w": 2584, "h": 1540}
+
+# 坐标覆盖文件(便于不改代码就换坐标)
+COORD_FILE = os.path.join(_HERE, "voice_button_coords.json")
+
+
+def _load_coords():
+    """读用户覆盖坐标(若有)。"""
+    if not os.path.isfile(COORD_FILE):
+        return {}, None
+    try:
+        with open(COORD_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        pts = {k: tuple(v) for k, v in (d.get("buttons") or {}).items()
+               if isinstance(v, (list, tuple)) and len(v) == 2}
+        win = d.get("window")
+        return pts, win
+    except Exception:
+        return {}, None
+
+
+_USER_PTS, _USER_WIN = _load_coords()
+if _USER_PTS:
+    BUTTONS_MEASURED.update(_USER_PTS)
+    if _USER_WIN:
+        MEASURED_WINDOW = _USER_WIN
+
+# 兼容旧名
+ANCHOR = BUTTONS_MEASURED
 
 # 录制状态判据:录音时工具栏会出现绿色声波条
 REC_GREEN_MIN = 800         # 绿色像素数超过此值视为"正在录制"
@@ -279,11 +321,38 @@ def _grab_image(hwnd):
     return img, (x, y, w, h)
 
 
-def anchor_pos(hwnd, key):
-    """按【距右/下边缘偏移】算按钮绝对坐标(比比例更稳)。"""
-    dr, db = ANCHOR[key]
+def anchor_pos(hwnd, key, verbose=False):
+    """算按钮的屏幕绝对坐标。
+
+    策略(按可靠性排序):
+      1. 若当前窗口尺寸与**测量时**一致 -> 直接用实测绝对坐标(最准);
+      2. 否则按窗口尺寸比例换算(保持按钮在窗口中的相对位置);
+      3. 再退一步:按"距右/下边缘偏移"换算。
+
+    早期版本只用方案 3,结果基准窗口不同就整体偏移 12 像素 -> 点空。
+    """
+    mx, my = BUTTONS_MEASURED[key]
     x, y, w, h = _win_rect(hwnd)
-    return (x + w - dr, y + h - db)
+    mw = MEASURED_WINDOW.get("w") or 2584
+    mh = MEASURED_WINDOW.get("h") or 1540
+    mx0 = MEASURED_WINDOW.get("x", 0)
+    my0 = MEASURED_WINDOW.get("y", 0)
+
+    # 方案 1:尺寸一致,直接用实测值
+    if abs(w - mw) <= 4 and abs(h - mh) <= 4:
+        if verbose:
+            print("       [坐标] 用实测值 %s" % ((mx, my),))
+        return mx, my
+
+    # 方案 2:窗口内相对位置等比换算
+    fx = (mx - mx0) / float(mw)
+    fy = (my - my0) / float(mh)
+    px = x + int(round(fx * w))
+    py = y + int(round(fy * h))
+    if verbose:
+        print("       [坐标] 窗口 %dx%d != 测量时 %dx%d -> 等比换算 (%d,%d)"
+              % (w, h, mw, mh, px, py))
+    return px, py
 
 
 def is_recording(hwnd, verbose=False):

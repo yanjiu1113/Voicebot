@@ -60,3 +60,6 @@ desktop.ini
 # voice_bot.py 含个人 CHATS 配置(真实微信号),不进仓库。
 # 发布版用 voice_bot.example.py 作为模板。
 01_核心模块/voice_bot.py
+
+# 按钮坐标(每台机器/每个窗口尺寸可能不同)
+01_核心模块/voice_button_coords.json
