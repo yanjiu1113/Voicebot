@@ -306,34 +306,47 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
             return res
         log("  [会话] 当前标题「%s」≠ 目标「%s」-> 需要点击" % (title, target))
     else:
-        log("  [会话] OCR 未读出标题 -> 回退高亮检测")
+        # ⚠️ 标题为空有两种含义,必须区分:
+        #    ① OCR 失败(截图模糊/标题太特殊)
+        #    ② 会话真的没打开 —— 例如会话被 toggle 关闭后,
+        #       右侧变成空白,标题自然是空。
+        #
+        # 旧代码把两者混为一谈,都用"该行是否绿色高亮"来推断"已打开"。
+        # 实测这会**误判**:会话框空白时第 0 行仍是绿色
+        # (绿色标记的是"最近聊天",不是"当前正在打开"),
+        # 于是程序以为会话已打开 -> 跳过点击 -> 在空白会话上录音发送 -> 失败。
+        #
+        # 现在的策略:标题为空就**不算已打开**,继续走点击流程;
+        # 点击后用标题确认,确认不了再退回高亮检测。
+        log("  [会话] 标题为空 -> 视为【未打开】,继续点击(不靠高亮推断)")
 
-    # --- 2. 回退:高亮检测 ---
-    if not title:
+    # --- 2. 高亮检测只作辅助(不再单独作为"已打开"的依据) ---
+    if not title and strict is False:
         hl, frac = is_row_highlighted(hwnd, row, debug=verbose)
         if hl:
-            log("  [会话] 第%d行高亮(%.0f%%)-> 认定已打开,跳过点击" % (row, frac * 100))
+            log("  [会话] 第%d行高亮(%.0f%%)-> 非严格模式:认定已打开" % (row, frac * 100))
             res.update(ok=True, action="skip", by="highlight")
             return res
-        log("  [会话] 第%d行未高亮(%.0f%%)-> 点击" % (row, frac * 100))
 
     # --- 3. 点击打开 ---
     #
-    # 行号会漂移,而且 `--list` 的编号(按最后消息时间)与界面顺序
-    # (置顶+时间)**并不一致**。所以在点行之前,先用搜索框定位 ——
-    # 搜索是按名字找,不依赖行号,可靠得多。
-    if target and method in ("auto", "search"):
+    # 定位策略(method):
+    #   'auto'(默认): 先逐行探测(可靠),再按配置行号点。
+    #                  **不先用搜索框** —— 实测搜索框那条路一直失败
+    #                  (点 (504,131) 后标题不变),只是白白多等近 2 秒。
+    #   'probe': 只逐行探测
+    #   'search': 只用搜索框(实测不可靠,保留备查)
+    #   'row'  : 只按行号点
+    if target and method == "search":
         s = open_chat_by_search(hwnd, name, verbose=verbose, settle=settle,
                                 max_retry=max(1, max_retry - 1))
         if s.get("ok"):
             res.update(ok=True, action="search", by=s.get("by"), title=s.get("title"))
             return res
         log("  [搜索] 未成功(%s)" % s.get("note"))
-        if method == "search":
-            res.update(ok=False, action="abort", by="none",
-                       note="搜索定位失败: %s" % s.get("note"))
-            return res
-        log("  [会话] 退回按行号点击")
+        res.update(ok=False, action="abort", by="none",
+                   note="搜索定位失败: %s" % s.get("note"))
+        return res
 
     import wx_voice_sender as vS
 
@@ -341,15 +354,32 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
     #    配置里的 row 是"上次标定时的行号",而会话列表顺序会变
     #    (实测:文件传输助手从第 0 行漂到第 1 行)。
     #    所以这里**逐个试**若干行,用 OCR 标题确认到底哪一行是目标。
+    #
+    #    ⚠️ toggle 陷阱:点"已打开"的会话会把它**关掉**。
+    #       所以每一轮点之前都先读标题 —— 如果这一行正好是当前打开的,
+    #       再点就会关闭它。为避免自伤,这里:
+    #         · 点之前记录当前标题;
+    #         · 点之后若标题变成空 -> 说明把会话点关了,立刻重点一次;
+    #         · 读到与目标不符时,先把这一行"关掉"的影响消除再继续。
     if target and method in ("auto", "probe"):
         log("  [探测] 配置的 row=%d 可能已漂移,逐行查找「%s」…" % (row, name))
         found_row = None
         found_title = ""
         for r in range(probe_rows):
             gx, gy = vS.session_row_pos(hwnd, r)
+            _, before = read_chat_title(hwnd, debug=False)
             click_fn(gx, gy)
             time.sleep(settle)
             _, t = read_chat_title(hwnd, debug=False)
+
+            # 点完变成空白 -> 刚才点到的是"已打开"的那一行,把它关掉了。
+            # 需要重新打开它,否则会话框会一直空白。
+            if not t and before:
+                log("  [探测] 第%d行原为「%s」,点击后被关闭 -> 重新打开" % (r, before))
+                click_fn(gx, gy)
+                time.sleep(settle)
+                _, t = read_chat_title(hwnd, debug=False)
+
             if t and target in t:
                 found_row, found_title = r, t
                 log("  [探测] 第%d行 = 「%s」✅" % (r, t))
@@ -383,25 +413,50 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
             log("  [会话] 点击后标题为「%s」,与目标不符 -> 行号可能已漂移" % t)
             break
         else:
+            # 标题为空 —— 可能是 OCR 不稳,也可能会话真没打开。
+            # 再用高亮辅助判断一次,但仍要**再读一次标题**做最终确认。
             hl, frac = is_row_highlighted(hwnd, row, debug=False)
             if hl:
-                log("  [会话] 点击后第%d行高亮(%.0f%%)✅" % (row, frac * 100))
-                res.update(ok=True, action="click", by="highlight")
-                return res
+                time.sleep(0.5)
+                _, t2 = read_chat_title(hwnd, debug=False)
+                if t2 and (not target or target in t2):
+                    log("  [会话] 高亮+标题复核通过「%s」✅" % t2)
+                    res.update(ok=True, action="click", by="ocr", title=t2)
+                    return res
+                log("  [会话] 第%d行高亮(%.0f%%)但标题为空/不符 -> 不算打开"
+                    % (row, frac * 100))
             log("  [会话] 点击后仍无法确认(第%d次)" % (attempt + 1))
 
-    # --- 4. 两条验证都失败 ---
+    # --- 4. 终检:再读一次标题 ---
+    #
+    # 走到这里说明前面没能确认。**最后一次机会**:如果此刻标题确实匹配,
+    # 说明其实已经打开了(只是刚才那一次读失败),可以放行。
+    time.sleep(0.4)
+    _, final_title = read_chat_title(hwnd, debug=False)
+    if target and final_title and target in final_title:
+        log("  [会话] 终检通过「%s」✅" % final_title)
+        res.update(ok=True, action="click", by="ocr-final", title=final_title)
+        return res
+
+    # --- 5. 判失败 ---
     #
     # 重要:此时我们**不知道当前打开的是哪个会话**。
-    # 如果继续发语音条,可能发到错误的人那里 —— 这个代价远大于"不发"。
-    # 因此默认返回失败,由调用方中止本次发送。
+    # 如果继续发语音条,可能发到错误的人那里,或者发到空白会话
+    # (表现为:鼠标动了、点了发送,但什么也没发出去)。
+    # 因此中止本次发送。
     #
     # (早期版本这里返回 ok=True 并"保守继续",那是错的:
     #  它把"无法确认"当成了"安全",实际是最高风险的时刻。)
-    log("  [会话] ✗ 无法确认会话状态(OCR 读不出标题,第%d行也未高亮)" % row)
-    log("         为安全起见中止本次发送,避免发错人")
-    res.update(ok=False, action="abort", by="none",
-               note="无法确认会话状态(OCR 与高亮校验均失败),已中止发送")
+    if not final_title:
+        log("  [会话] ✗ 当前会话框是空白的(没有选中任何会话)")
+        log("         可能是上一次点击把它 toggle 关闭了")
+        note = "会话框空白(未选中任何会话),已中止发送"
+    else:
+        log("  [会话] ✗ 无法确认会话状态(当前标题「%s」与目标「%s」不符)"
+            % (final_title, target))
+        note = "无法确认会话状态(标题不符),已中止发送"
+    log("         为安全起见中止本次发送,避免发错人/发空")
+    res.update(ok=False, action="abort", by="none", title=final_title, note=note)
     return res
 
 
