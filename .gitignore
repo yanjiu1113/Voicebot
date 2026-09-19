@@ -56,3 +56,7 @@ reference_config.json
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# voice_bot.py 含个人 CHATS 配置(真实微信号),不进仓库。
+# 发布版用 voice_bot.example.py 作为模板。
+01_核心模块/voice_bot.py

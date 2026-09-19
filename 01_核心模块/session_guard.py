@@ -254,27 +254,34 @@ def open_chat_by_search(hwnd, name, verbose=True, settle=1.2, max_retry=2):
 
 
 def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
-                     settle=1.2, max_retry=2, strict=True, method="auto"):
+                     settle=1.2, max_retry=2, strict=True, method="auto",
+                     probe_rows=6):
     """确保「name」对应的会话处于打开状态。
 
     strict=True(默认):无法确认会话状态时返回 ok=False,由调用方中止发送。
                        宁可这条不发,也不能发错人。
     strict=False       :沿用旧的"保守继续"行为(不推荐)。
 
-    核心逻辑(解决 toggle 关闭问题):
+    核心逻辑(解决 toggle 关闭问题 + 行号漂移):
         1. 先读当前聊天标题
         2. 若已是目标会话  -> 【不点击】直接返回
-        3. 否则点击目标行  -> 读标题确认;读不出再查该行是否高亮
-        4. 仍无法确认      -> strict 时判失败
+        3. 逐行探测        -> 点第 0..probe_rows-1 行,用 OCR 标题找目标
+                              (行号会漂移,实测文件传输助手从第0行漂到第1行)
+        4. 按配置行号点击  -> 读标题确认;读不出再查该行是否高亮
+        5. 仍无法确认      -> strict 时判失败
 
     Args:
         click_fn: 可调用对象,签名 f(x, y) 执行一次点击
         settle: 点击/切换后等待秒数
         strict: 无法确认时是否判失败(默认 True)
+        method: 'auto' 先逐行探测再按行号点;'probe' 只探测;
+                'search' 先用搜索框(实测搜索框不可靠);'row' 只按行号
+        probe_rows: 逐行探测时最多试几行
 
     Returns:
         dict: {ok, action, by, title, note}
-            action: 'skip'(未点击) / 'click'(已点击) / 'abort'(中止)
+            action: 'skip'(未点击) / 'probe'(探测命中) /
+                    'click'(按行号点击) / 'abort'(中止)
             by:     'ocr' / 'highlight' / 'none'
     """
     if click_fn is None:
@@ -329,6 +336,37 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
         log("  [会话] 退回按行号点击")
 
     import wx_voice_sender as vS
+
+    # --- 3a. 行号漂移自动纠正 ---
+    #    配置里的 row 是"上次标定时的行号",而会话列表顺序会变
+    #    (实测:文件传输助手从第 0 行漂到第 1 行)。
+    #    所以这里**逐个试**若干行,用 OCR 标题确认到底哪一行是目标。
+    if target and method in ("auto", "probe"):
+        log("  [探测] 配置的 row=%d 可能已漂移,逐行查找「%s」…" % (row, name))
+        found_row = None
+        found_title = ""
+        for r in range(probe_rows):
+            gx, gy = vS.session_row_pos(hwnd, r)
+            click_fn(gx, gy)
+            time.sleep(settle)
+            _, t = read_chat_title(hwnd, debug=False)
+            if t and target in t:
+                found_row, found_title = r, t
+                log("  [探测] 第%d行 = 「%s」✅" % (r, t))
+                break
+            log("  [探测] 第%d行 -> 「%s」不符" % (r, t or "(读不出)"))
+        if found_row is not None:
+            note = ""
+            if found_row != row:
+                note = ("row 已漂移: 配置 %d -> 实际 %d(建议把该会话置顶以固定)"
+                        % (row, found_row))
+                log("  [探测] ⚠ " + note)
+            res.update(ok=True, action="probe", by="ocr",
+                       title=found_title, row_found=found_row, note=note)
+            return res
+        log("  [探测] %d 行内没找到「%s」" % (probe_rows, name))
+
+    # --- 3b. 按配置行号点击 ---
     x, y = vS.session_row_pos(hwnd, row)
     for attempt in range(max_retry):
         log("  [会话] 点击第%d行 (%d,%d) 第%d次" % (row, x, y, attempt + 1))
