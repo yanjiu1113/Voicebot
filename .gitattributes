@@ -1,0 +1,40 @@
+# 换行策略 —— 这个文件是给"别人 clone 时"兜底的
+#
+# 背景(实测踩过):
+#   三个 .cmd 启动器曾经是纯 LF,而 Windows 批处理**必须** CRLF,
+#   否则 cmd.exe 会解析错乱(set 行被拆断、goto/标签/括号块行为异常)。
+#   光靠 core.autocrlf 不可靠 —— 它取决于克隆方的 git 配置。
+#   所以这里显式声明,保证任何人 clone 下来 .cmd 都是 CRLF。
+#
+# 注意:改完这个文件后要执行一次
+#     git add --renormalize .
+#   让已入库的内容按新规则重新归一(否则旧 blob 仍是 LF)。
+
+# Windows 批处理:必须 CRLF
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# 源码与文档:统一 LF(跨平台最省事,Python/Markdown 都不挑)
+*.py   text eol=lf
+*.pyw  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.toml text eol=lf
+*.cfg  text eol=lf
+*.ini  text eol=lf
+*.sh   text eol=lf
+
+# 二进制,不要做任何换行转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.wav  binary
+*.mp3  binary
+*.zip  binary
+*.7z   binary
+*.ckpt binary
+*.pth  binary
+*.pyc  binary
