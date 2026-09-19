@@ -55,6 +55,14 @@ WX_GREENS = ((21, 172, 112), (0, 195, 117), (7, 193, 96), (26, 173, 117))
 GREEN_TOL = 30
 GREEN_FRAC_HIT = 0.5         # 绿色占比超过此值判为高亮
 
+# 判断"聊天区上部有没有内容":三段唯一色之和的阈值
+# 实测:有消息 ≈ 54,无消息/空白 ≈ 6。取 15 留足余量。
+MSG_UNIQ_OPEN = 15
+
+# 标题区灰度极差:低于此值说明标题栏没有文字 -> 会话框是空白的
+# 实测:打开 = 225,空白 = 0。取 40 留足余量。
+TITLE_RANGE_BLANK = 40
+
 
 def _rect(hwnd):
     r = wintypes.RECT()
@@ -162,8 +170,121 @@ def read_chat_title(hwnd, debug=False):
     return txt, _norm(txt)
 
 
+def screen_grab(hwnd):
+    """用屏幕 BitBlt 抓窗口区域,返回 (PIL.Image, (x,y,w,h))。
+
+    为什么不用 PrintWindow:
+        实测微信的聊天区是**自绘渲染**,PrintWindow 抓出来是纯色
+        (唯一色只有 2 个),看不到任何消息内容;
+        而屏幕 BitBlt 能正常抓到(唯一色近 300)。
+        判断"会话是否打开"必须用这个。
+    """
+    from PIL import Image
+    x, y, w, h = _rect(hwnd)
+    W = _user32.GetSystemMetrics(0)
+    H = _user32.GetSystemMetrics(1)
+    hdc = _user32.GetDC(0)
+    mem = _gdi32.CreateCompatibleDC(hdc)
+    bm = _gdi32.CreateCompatibleBitmap(hdc, W, H)
+    _gdi32.SelectObject(mem, bm)
+    _gdi32.BitBlt(mem, 0, 0, W, H, hdc, 0, 0, 0x00CC0020)
+
+    class BIH(ctypes.Structure):
+        _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                    ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD)]
+
+    class BI(ctypes.Structure):
+        _fields_ = [("bmiHeader", BIH), ("bmiColors", wintypes.DWORD * 3)]
+
+    bi = BI()
+    bi.bmiHeader.biSize = ctypes.sizeof(BIH)
+    bi.bmiHeader.biWidth = W
+    bi.bmiHeader.biHeight = -H
+    bi.bmiHeader.biPlanes = 1
+    bi.bmiHeader.biBitCount = 32
+    buf = ctypes.create_string_buffer(W * H * 4)
+    _gdi32.GetDIBits(mem, bm, 0, H, buf, ctypes.byref(bi), 0)
+    img = Image.frombuffer("RGBA", (W, H), buf, "raw", "BGRA", 0, 1).convert("RGB")
+    _gdi32.DeleteObject(bm)
+    _gdi32.DeleteDC(mem)
+    _user32.ReleaseDC(0, hdc)
+    return img, (x, y, w, h)
+
+
+def is_chat_open(hwnd):
+    """判断右侧聊天区是否**真的打开了某个会话**(不依赖 OCR)。
+
+    原理:
+        聊天区上部有消息内容时颜色丰富;没内容(空白或空会话)时近乎纯色。
+        实测(窗口内坐标 y150~700, x700~2300):
+            会话B(有消息)  唯一色 24 / 16 / 14
+            会话C(无消息)  唯一色 1 / 1 / 4
+            会话框空白         唯一色 1 / 1 / 4
+
+        ⚠️ 注意:这个判据只能区分"有没有消息内容",
+           **不能区分"空会话"和"完全空白"**。所以它只用于:
+             · 确认点击后确实切换了(内容变了)
+             · 避免在明显空白时盲目再点
+           判定"是否为目标会话"仍然以 OCR 标题为准。
+
+    Returns: (是否有内容, 唯一色总数)
+    """
+    import numpy as np
+    img, (x, y, w, h) = screen_grab(hwnd)
+    a = np.array(img)
+    total = 0
+    parts = []
+    for ry0, ry1 in ((150, 300), (300, 500), (500, 700)):
+        px0 = x + int(700 * w / BASE_W)
+        px1 = x + int(2300 * w / BASE_W)
+        py0 = y + int(ry0 * h / BASE_H)
+        py1 = y + int(ry1 * h / BASE_H)
+        px0, py0 = max(0, px0), max(0, py0)
+        px1, py1 = min(a.shape[1], px1), min(a.shape[0], py1)
+        if px1 <= px0 or py1 <= py0:
+            continue
+        box = (a[py0:py1, px0:px1, :3] // 16).reshape(-1, 3)
+        u = int(len(np.unique(box, axis=0)))
+        parts.append(u)
+        total += u
+    return total >= MSG_UNIQ_OPEN, total
+
+
+def title_area_range(hwnd):
+    """标题区的灰度极差 —— 判断"有没有打开会话"的**硬判据**。
+
+    原理:
+        会话打开时,标题栏有文字 -> 灰度极差大;
+        会话框空白(未选中任何会话)时,标题区是纯色 -> 极差 ≈ 0。
+        实测:打开 = 225,空白 = 0。
+
+    ⚠️ 这是**不依赖 OCR** 的判据,比"标题读不读得出"可靠得多。
+       实测 OCR 在会话打开时基本都能读出,读不出的情况几乎都是真的空白。
+
+    返回 (是否空白, 极差)
+    """
+    import numpy as np
+    img, _ = _grab(hwnd)          # PrintWindow 能截到标题区(常规绘制)
+    w, h = img.size
+    sx = w / float(BASE_W)
+    sy = h / float(BASE_H)
+    x0, y0, x1, y1 = TITLE_BOX
+    c = img.crop((int(x0 * sx), int(y0 * sy), int(x1 * sx), int(y1 * sy)))
+    a = np.array(c.convert("L")).astype(np.float32)
+    rng = float(a.max() - a.min())
+    return rng < TITLE_RANGE_BLANK, rng
+
+
 def is_row_highlighted(hwnd, row, debug=False):
     """判断会话列表第 row 行是否为活动(高亮)行。
+
+    ⚠️ 注意:绿色高亮标记的是"最近聊天",**不等于"当前正在打开"**。
+       会话框空白时,第 0 行仍然是绿色。所以它只能当辅助判据,
+       判断"是否已打开"请用 is_chat_open()。
 
     row 是**界面行号**(0 起),坐标以截图为基准换算,与窗口在屏幕上的
     位置无关 —— 实测窗口原点为 (-12,-12) 时依然正确。
@@ -294,34 +415,53 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
 
     res = {"ok": False, "action": None, "by": None, "title": "", "note": ""}
 
-    # --- 1. 先看当前标题 ---
+    # --- 0. 先判断"聊天区是否真的打开了会话" ---
+    #
+    # 这是最关键的一步,而且是**不依赖 OCR** 的硬判据:
+    #   会话打开 -> 消息区有头像/气泡/文字,量化色数 ≈ 290
+    #   会话框空白 -> 大面积纯色,量化色数 ≈ 2
+    # (PrintWindow 截不到微信自绘的聊天区,所以这里用屏幕 BitBlt)
+    #
+    # 为什么必须区分:
+    #   会话框**空白**时,标题读出来是空,而且第 0 行**仍然是绿色**
+    #   (绿色标记"最近聊天",不是"正在打开")。若据此认为"已打开",
+    #   就会跳过点击 -> 在空白会话上录音发送 -> 鼠标动了却发不出去;
+    #   反过来若盲目点击,又会把本来打开的会话 toggle 关闭。
+    open_now, uniq = is_chat_open(hwnd)
+    blank, t_range = title_area_range(hwnd)
     title_raw, title = read_chat_title(hwnd, debug=verbose)
     target = _norm(name)
     res["title"] = title
+    res["open_pixels"] = uniq
+    res["title_range"] = t_range
+    log("  [会话] 标题区极差=%.0f -> %s;聊天区色数=%d" % (
+        t_range, "会话框空白" if blank else "有会话", uniq))
 
-    if title:
-        if target and target in title:
+    if not blank:
+        # 标题栏有文字 -> 确实打开了某个会话。别乱点,点了会关闭它。
+        if title and target and target in title:
             log("  [会话] 标题已匹配「%s」-> 跳过点击(避免 toggle 关闭)" % name)
             res.update(ok=True, action="skip", by="ocr")
             return res
-        log("  [会话] 当前标题「%s」≠ 目标「%s」-> 需要点击" % (title, target))
+        if title:
+            log("  [会话] 当前标题「%s」≠ 目标「%s」-> 需要切换" % (title, target))
+        else:
+            # 有会话打开,但标题 OCR 读不出 —— 宁可不动(避免误关)
+            log("  [会话] 有会话打开但标题读不出 -> 用活动行辅助判断")
+            hl, frac = is_row_highlighted(hwnd, row, debug=verbose)
+            if hl:
+                log("  [会话] 第%d行是活动行(%.0f%%)-> 视为已打开,跳过" % (row, frac * 100))
+                res.update(ok=True, action="skip", by="highlight-open")
+                return res
+            log("  [会话] 第%d行非活动行 -> 需要切换,但无法确认目标,保守中止" % row)
+            res.update(ok=False, action="abort", by="none",
+                       note="标题读不出且行号非活动行,无法安全切换")
+            return res
     else:
-        # ⚠️ 标题为空有两种含义,必须区分:
-        #    ① OCR 失败(截图模糊/标题太特殊)
-        #    ② 会话真的没打开 —— 例如会话被 toggle 关闭后,
-        #       右侧变成空白,标题自然是空。
-        #
-        # 旧代码把两者混为一谈,都用"该行是否绿色高亮"来推断"已打开"。
-        # 实测这会**误判**:会话框空白时第 0 行仍是绿色
-        # (绿色标记的是"最近聊天",不是"当前正在打开"),
-        # 于是程序以为会话已打开 -> 跳过点击 -> 在空白会话上录音发送 -> 失败。
-        #
-        # 现在的策略:标题为空就**不算已打开**,继续走点击流程;
-        # 点击后用标题确认,确认不了再退回高亮检测。
-        log("  [会话] 标题为空 -> 视为【未打开】,继续点击(不靠高亮推断)")
+        log("  [会话] 会话框是空白的 -> 必须点击打开")
 
     # --- 2. 高亮检测只作辅助(不再单独作为"已打开"的依据) ---
-    if not title and strict is False:
+    if not open_now and strict is False:
         hl, frac = is_row_highlighted(hwnd, row, debug=verbose)
         if hl:
             log("  [会话] 第%d行高亮(%.0f%%)-> 非严格模式:认定已打开" % (row, frac * 100))
@@ -356,30 +496,27 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
     #    所以这里**逐个试**若干行,用 OCR 标题确认到底哪一行是目标。
     #
     #    ⚠️ toggle 陷阱:点"已打开"的会话会把它**关掉**。
-    #       所以每一轮点之前都先读标题 —— 如果这一行正好是当前打开的,
-    #       再点就会关闭它。为避免自伤,这里:
-    #         · 点之前记录当前标题;
-    #         · 点之后若标题变成空 -> 说明把会话点关了,立刻重点一次;
-    #         · 读到与目标不符时,先把这一行"关掉"的影响消除再继续。
-    if target and method in ("auto", "probe"):
-        log("  [探测] 配置的 row=%d 可能已漂移,逐行查找「%s」…" % (row, name))
+    #       为彻底避免自伤,进入探测前先确认聊天区是**空白**的
+    #       (若已有会话打开,直接走 3b 按行号切换,不做逐行试探)。
+    if target and method in ("auto", "probe") and not open_now:
+        log("  [探测] 聊天区空白,逐行查找「%s」(最多 %d 行)…" % (name, probe_rows))
         found_row = None
         found_title = ""
         for r in range(probe_rows):
             gx, gy = vS.session_row_pos(hwnd, r)
-            _, before = read_chat_title(hwnd, debug=False)
             click_fn(gx, gy)
             time.sleep(settle)
             _, t = read_chat_title(hwnd, debug=False)
 
             # 点完变成空白 -> 刚才点到的是"已打开"的那一行,把它关掉了。
             # 需要重新打开它,否则会话框会一直空白。
-            if not t and before:
-                log("  [探测] 第%d行原为「%s」,点击后被关闭 -> 重新打开" % (r, before))
-                click_fn(gx, gy)
-                time.sleep(settle)
-                _, t = read_chat_title(hwnd, debug=False)
-
+            if not t:
+                still_open, _u = is_chat_open(hwnd)
+                if not still_open:
+                    log("  [探测] 第%d行点击后聊天区仍空白 -> 再点一次" % r)
+                    click_fn(gx, gy)
+                    time.sleep(settle)
+                    _, t = read_chat_title(hwnd, debug=False)
             if t and target in t:
                 found_row, found_title = r, t
                 log("  [探测] 第%d行 = 「%s」✅" % (r, t))
