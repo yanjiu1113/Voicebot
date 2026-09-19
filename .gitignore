@@ -1,0 +1,49 @@
+# ============================================================
+# VoiceBot —— 发 Git 前的忽略规则
+# ============================================================
+
+# ---- 敏感信息(必须忽略,否则 key 会泄露) ----
+config.py
+config.py.bak
+*.key
+*.secret
+.env
+.env.*
+
+# ---- 大体积目录(不要进仓库) ----
+# vendor_py 是 pip 安装的依赖(312MB),应当用 pip 重新安装
+#   pip install wechatauto-replica pywechat127 sounddevice pypinyin winsdk ...
+vendor_py/
+__pycache__/
+*.pyc
+*.pyo
+
+# libs/ 里是 wxautox4_wechatbot 等**商业授权**安装包(42MB),
+# 分发可能违反其许可,务必忽略!
+libs/
+*.whl
+*.tar.gz
+
+# 音频与截图(诊断产物,可重新生成)
+04_音频留存/*.wav
+04_音频留存/项目诊断音频/
+05_文档/发送截图/
+05_文档/旧版备份/
+05_文档/配置备份/
+*.wav
+*.png
+*.jpg
+*.jpeg
+
+# 运行时状态
+voice_bot_state.json
+*.log
+
+# ---- 模型权重(极大,单独管理) ----
+*.ckpt
+*.pth
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
+.DS_Store

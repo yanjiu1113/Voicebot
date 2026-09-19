@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "max_files": 200,
+  "max_total_mb": 300,
+  "max_age_days": 7,
+  "min_age_hours": 24,
+  "extensions": [".wav", ".png", ".jpg", ".jpeg"],
+  "keep_names": [],
+  "dirs": [
+    ".",
+    "项目诊断音频",
+    "../05_文档/发送截图",
+    "../../WeChatBot_WXAUTO_SE-3.28/Voice_Temp",
+    "../../WeChatBot_WXAUTO_SE-3.28/voice_bot_shots"
+  ]
+}
