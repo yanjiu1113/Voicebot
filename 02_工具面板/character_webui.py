@@ -32,6 +32,7 @@ from flask import Flask, jsonify, request
 # 路径
 # ---------------------------------------------------------------------------
 HERE = os.path.dirname(os.path.abspath(__file__))
+TOOLS = HERE                                       # VoiceBot/02_工具面板
 ROOT = os.path.dirname(HERE)                      # VoiceBot/
 DESKTOP = os.path.dirname(ROOT)
 PROJECT = os.path.join(DESKTOP, "WeChatBot_WXAUTO_SE-3.28")
@@ -737,6 +738,14 @@ def index():
 
 
 def main():
+    # 首次运行:确保 voice_bot.py 存在(从模板生成),否则本页面读不到角色
+    try:
+        sys.path.insert(0, TOOLS)
+        import 初始化配置 as _init
+        _init.ensure(create=True, quiet=True)
+    except Exception:
+        pass
+
     # ⚠️ 关键:用 pythonw.exe 启动时没有 stdout/stderr,
     #    直接 print() 会抛 OSError 导致进程静默退出。
     #    所以这里先把标准输出重定向到日志文件。

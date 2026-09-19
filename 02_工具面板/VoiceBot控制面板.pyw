@@ -519,7 +519,27 @@ class Panel:
         threading.Thread(target=work, daemon=True).start()
 
 
+def _bootstrap_voice_bot():
+    """首次运行时确保 voice_bot.py 存在(从 voice_bot.example.py 生成)。
+
+    voice_bot.py 含个人配置,被 .gitignore 忽略;新用户 clone 下来没有它。
+    没有这一步,面板里所有"发送/自检"按钮都会报"找不到 voice_bot.py"。
+    失败不阻断面板启动 —— 只提示,让用户还能用配置面板。
+    """
+    try:
+        sys.path.insert(0, TOOLS)
+        import 初始化配置 as _init
+        ok, action = _init.ensure(create=True, quiet=True)
+        if action == "created":
+            print("[配置] 已从模板生成 voice_bot.py(请先在「角色配置」里填对象)")
+        return ok
+    except Exception as e:
+        print("[配置] 引导失败(不影响面板启动): %s" % str(e)[:80])
+        return False
+
+
 def main():
+    _bootstrap_voice_bot()
     root = tk.Tk()
     Panel(root)
     root.mainloop()

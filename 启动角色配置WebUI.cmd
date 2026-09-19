@@ -2,8 +2,15 @@
 chcp 65001 >nul
 title VoiceBot - character Web UI
 set "ROOT=%~dp0"
-set "PYW=C:\Users\sduser\AppData\Local\Programs\Python\Python310\pythonw.exe"
-if not exist "%PYW%" set "PYW=pythonw"
+rem ---- 定位 Python(不写死路径,换机器也能用)----
+set "PYW="
+for %%I in (pythonw.exe) do if not defined PYW set "PYW=%%~$PATH:I"
+if not defined PYW if exist "%LOCALAPPDATA%\Programs\Python\Python313\pythonw.exe" set "PYW=%LOCALAPPDATA%\Programs\Python\Python313\pythonw.exe"
+if not defined PYW if exist "%LOCALAPPDATA%\Programs\Python\Python312\pythonw.exe" set "PYW=%LOCALAPPDATA%\Programs\Python\Python312\pythonw.exe"
+if not defined PYW if exist "%LOCALAPPDATA%\Programs\Python\Python311\pythonw.exe" set "PYW=%LOCALAPPDATA%\Programs\Python\Python311\pythonw.exe"
+if not defined PYW if exist "%LOCALAPPDATA%\Programs\Python\Python310\pythonw.exe" set "PYW=%LOCALAPPDATA%\Programs\Python\Python310\pythonw.exe"
+if not defined PYW if exist "%LOCALAPPDATA%\Programs\Python\Python39\pythonw.exe" set "PYW=%LOCALAPPDATA%\Programs\Python\Python39\pythonw.exe"
+if not defined PYW set "PYW=pythonw"
 
 echo ==================================================================
 echo   启动「角色配置 Web UI」

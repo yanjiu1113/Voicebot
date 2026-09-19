@@ -2,14 +2,21 @@
 """
 生成发布模板 voice_bot.example.py
 
-把 01_核心模块/voice_bot.py 里的真实配置(CHATS: 真实微信号/昵称/persona)
+把 01_核心模块/voice_bot.py 里的真实配置(CHATS: 真实微信号 / 昵称 / persona)
 换成占位,输出 voice_bot.example.py 供发布到 Git 仓库。
 
 voice_bot.py 本身被 .gitignore 忽略(含个人配置),仓库里只放这份模板。
 
+自检方式(重要):
+    本脚本**不硬编码任何个人信息**(否则它自己就成了泄漏源)。
+    它改为**从 voice_bot.py 里把 CHATS 的 key / name / persona 指纹提取出来**,
+    再回头确认这些东西**没有出现在生成的模板里**;另外叠加通用模式
+    (wxid_xxx / sk-xxx / 本机用户名路径)。任何一项命中就中止,不写文件。
+
 用法:
     python 02_工具面板/生成发布模板.py
 """
+import ast
 import io
 import os
 import re
@@ -26,7 +33,8 @@ TEMPLATE = '''CHATS = {
     # 用  python voice_bot.py --list  查看所有会话的真实 username。
     #
     # ⚠️ row 是"会话在**界面**列表里的行号"(0 起,置顶会话也算)。
-    #    界面顺序 = 置顶 + 最后消息时间,和 --list 的数据库顺序**不一样**。
+    #    界面顺序 = 置顶 + 最后消息时间,和 --list 的数据库顺序**不一样**,
+    #    所以 --list 的序号不能直接当 row 用!
     #    行号会随时间漂移 —— 强烈建议把要自动回复的会话【置顶】,
     #    这样行号才稳定。即使填错也不会发错人:发送前会 OCR 核对标题。
     "请填对方的微信号或昵称": {
@@ -47,9 +55,42 @@ TEMPLATE = '''CHATS = {
 }
 '''
 
-# 不允许出现在发布版里的真实标识
-SENSITIVE = ("你的微信号", "会话B", "爱丽希雅", "逐火之蛾",
-             "DEEPSEEK_API_KEY = 'sk", "sk-")
+# 通用模式:与具体是谁无关,任何真值都算可疑
+# 注意:`wxid_xxxxxxxxxxxxxxxx` 这类**占位符**要放过 —— 排除全同一个字符的情况。
+GENERIC_PATTERNS = [
+    (r"wxid_(?!x{6,})(?![0]{6,})[a-z0-9]{8,}", "疑似真实 wxid"),
+    (r"sk-[A-Za-z0-9]{20,}", "疑似 API Key"),
+    (r"[A-Za-z]:\\\\Users\\\\[^\\\\\s\"']+", "疑似本机用户目录(泄漏用户名)"),
+]
+
+
+def collect_secrets(src_text):
+    """从源文件里提取它**自己的**敏感词 —— 脚本本身不写死任何个人信息。
+
+    取 CHATS 的 key(真实微信号/昵称)与 persona 指纹。
+    """
+    secrets = set()
+    m = re.search(r"^CHATS\s*=\s*(\{.*?^\})", src_text, re.S | re.M)
+    if not m:
+        return secrets
+    try:
+        chats = ast.literal_eval(m.group(1))
+    except Exception:
+        return secrets
+    if not isinstance(chats, dict):
+        return secrets
+    for k, v in chats.items():
+        if isinstance(k, str) and len(k) >= 4:
+            secrets.add(k)
+        if isinstance(v, dict):
+            nm = v.get("name")
+            if isinstance(nm, str) and len(nm) >= 2:
+                secrets.add(nm)
+            p = v.get("persona")
+            if isinstance(p, str) and len(p) > 120:
+                secrets.add(p[:60])          # persona 开头指纹
+                secrets.add(p[-60:])         # persona 结尾指纹
+    return secrets
 
 
 def main():
@@ -59,6 +100,9 @@ def main():
     with io.open(SRC, encoding="utf-8") as f:
         text = f.read()
 
+    secrets = collect_secrets(text)
+    print("从 voice_bot.py 提取到 %d 个敏感词(不显示内容)" % len(secrets))
+
     pat = re.compile(r"^CHATS = \{.*?^\}\n", re.S | re.M)
     # 用函数做替换,避免 re.sub 把替换串里的 \n 当转义处理
     new, n = pat.subn(lambda m: TEMPLATE, text)
@@ -66,10 +110,19 @@ def main():
         print("替换 CHATS 块失败,匹配到 %d 处" % n)
         return 1
 
-    bad = [s for s in SENSITIVE if s in new]
+    bad = sorted(s for s in secrets if s and s in new)
     if bad:
-        print("‼ 发布版里仍有敏感内容,已中止:%s" % bad)
+        print("‼ 发布版里仍有真实配置内容(%d 项),已中止,未写文件" % len(bad))
+        for s in bad[:5]:
+            print("     …%s…" % s[:24])
         return 1
+
+    for rx, why in GENERIC_PATTERNS:
+        mm = re.search(rx, new)
+        if mm:
+            print("‼ 命中通用风险模式:%s -> %s" % (why, mm.group(0)[:40]))
+            print("   已中止,未写文件")
+            return 1
 
     with io.open(DST, "w", encoding="utf-8", newline="\n") as f:
         f.write(new)
@@ -78,7 +131,8 @@ def main():
     py_compile.compile(DST, doraise=True)
 
     print("已生成 %s(%d 字节)" % (DST, len(new)))
-    print("敏感串自检:通过 ✓")
+    print("敏感词自检:通过 ✓(零命中)")
+    print("通用模式自检:通过 ✓")
     print("语法检查:通过 ✓")
     return 0
 

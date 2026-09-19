@@ -350,13 +350,20 @@ AI 接口
 
   VoiceBot\
   ├── 启动.cmd                  ★ 启动菜单(推荐入口,双击选功能)
+  │                                [1]控制面板 [2]角色WebUI [3]配置面板
+  │                                [4]启TTS [5]自检 [6]演练 [7]实际发送
+  │                                [8]留存管理 [9]打开目录 [C]采集按钮坐标
   ├── 启动TTS服务.cmd             启动 api_v2.py(控制台窗口别关)
   ├── 启动角色配置WebUI.cmd        启动角色配置网站并打开浏览器
+  ├── VERSION / CHANGELOG.md    版本号与更新日志
   ├── 重要说明.txt              本文件
   ├── reference_config.json     参考音频配置(本机生成,不进仓库)
   ├── 参考音频\                 放参考音频素材(3~10 秒)
   ├── 01_核心模块\              程序本体
   │   ├── voice_bot.py              主程序:读消息 → AI → 合成 → 发送
+  │   │                              (含真实配置,不进仓库;首次运行自动生成)
+  │   ├── voice_bot.example.py      ↑ 的角色配置模板(发布用)
+  │   ├── voice_button_coords.json  按钮坐标覆盖文件(各机不同,不进仓库)
   │   ├── wx_voice_sender.py        语音条发送(含录制状态校验)
   │   ├── session_guard.py          会话检测(OCR 读标题,防误关会话)
   │   ├── gptsovits_tts.py          GPT-SoVITS 合成客户端
@@ -368,7 +375,10 @@ AI 接口
   │   ├── VoiceBot控制面板.pyw      ★ GUI 主入口
   │   ├── character_webui.py        角色配置 Web UI(5100 端口)
   │   ├── config_tool.py            配置面板(AI/音色/留存/参考音频)
-  │   └── set_reference.py          参考音频配置工具(命令行)
+  │   ├── set_reference.py          参考音频配置工具(命令行)
+  │   ├── 采集按钮坐标.py            换分辨率后重新标定按钮坐标
+  │   ├── 初始化配置.py              首次运行引导(缺 voice_bot.py 时自动生成)
+  │   └── 生成发布模板.py            发布前生成 voice_bot.example.py
   ├── 03_诊断测试\              各种自检脚本
   ├── 04_音频留存\              audio_retention.py + 音频文件
   ├── 05_文档\                  README / 发Git清单 / 配置备份 / 发送截图

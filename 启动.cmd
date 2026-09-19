@@ -3,14 +3,42 @@ chcp 65001 >nul
 setlocal
 title VoiceBot Launcher
 
-set "PYW=C:\Users\sduser\AppData\Local\Programs\Python\Python310\pythonw.exe"
-set "PY=C:\Users\sduser\AppData\Local\Programs\Python\Python310\python.exe"
-if not exist "%PY%" set "PY=python"
+rem ---- 定位 Python(不写死路径,换机器也能用)----
+set "PY="
+for %%I in (python.exe) do if not defined PY set "PY=%%~$PATH:I"
+if not defined PY if exist "%LOCALAPPDATA%\Programs\Python\Python313\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
+if not defined PY if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+if not defined PY if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
+if not defined PY if exist "%LOCALAPPDATA%\Programs\Python\Python310\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
+if not defined PY if exist "%LOCALAPPDATA%\Programs\Python\Python39\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python39\python.exe"
+if not defined PY if exist "C:\Python310\python.exe" set "PY=C:\Python310\python.exe"
+if not defined PY set "PY=python"
+set "PYW="
+for %%I in (pythonw.exe) do if not defined PYW set "PYW=%%~$PATH:I"
+if not defined PYW set "PYW=%PY:python.exe=pythonw.exe%"
 if not exist "%PYW%" set "PYW=%PY%"
+if not exist "%PY%" (
+  echo   [错误] 找不到 Python。请安装 Python 3.10+ 并勾选 "Add to PATH"。
+  pause
+  exit /b 1
+)
 
 set "ROOT=%~dp0"
 set "TOOLS=%ROOT%02_工具面板"
 set "CORE=%ROOT%01_核心模块"
+
+rem ---------------------------------------------------------------
+rem 首次运行引导:
+rem   voice_bot.py 含个人配置(要自动回复的对象),被 .gitignore 忽略,
+rem   仓库里只发布 voice_bot.example.py。新用户 clone 下来没有它,
+rem   下面的菜单会直接报错 —— 所以先自动从模板生成一份。
+rem ---------------------------------------------------------------
+if not exist "%CORE%\voice_bot.py" (
+  echo.
+  "%PY%" -X utf8 "%TOOLS%\初始化配置.py"
+  echo.
+  pause
+)
 
 :MENU
 cls
@@ -30,10 +58,11 @@ echo   [7] 语音回复 - 实际发送    ^(会真的发语音条^)
 echo.
 echo   [8] 音频留存管理
 echo   [9] 打开项目目录
+echo   [C] 采集按钮坐标          ^(换分辨率/窗口尺寸后重新标定^)
 echo   [0] 退出
 echo.
 echo ==================================================================
-set /p "C= 请选择 [0-9]: "
+set /p "C= 请选择 [0-9/C]: "
 
 if "%C%"=="1" goto CTRL
 if "%C%"=="2" goto WEBUI
@@ -44,6 +73,7 @@ if "%C%"=="6" goto DRY
 if "%C%"=="7" goto LIVE
 if "%C%"=="8" goto RET
 if "%C%"=="9" goto OPENDIR
+if /i "%C%"=="C" goto CALIB
 if "%C%"=="0" exit /b 0
 goto MENU
 
@@ -133,3 +163,11 @@ goto MENU
 :OPENDIR
 start "" explorer "%ROOT%"
 exit /b 0
+
+:CALIB
+echo.
+echo   采集按钮坐标
+echo   请先把微信窗口【最大化】,然后按提示把鼠标移到各个按钮上。
+echo.
+"%PY%" -X utf8 "%TOOLS%\采集按钮坐标.py"
+goto MENU
