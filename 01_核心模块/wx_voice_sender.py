@@ -239,9 +239,9 @@ TOOLBAR_Y_RATIO = 0.88      # 工具栏区起始 y 比例
 
 # 时序(秒)
 T_RECORD_SETTLE = 0.8       # 点录音后等待录音真正启动(用于状态检测)
-T_REC_SETTLE_AFTER = 1.2    # 确认进入录音态后,再等这么久才播放
+T_REC_SETTLE_AFTER = 0.7    # 确认进入录音态后,再等这么久才播放
                             # 实测:立刻播放会让开头一段丢失
-T_TAIL = 1.0                # 播完后留的尾巴(避免截断)
+T_TAIL = 0.5                # 播完后留的尾巴(避免截断;太长会变成尾部静音)
 T_AFTER_SEND = 2.0
 
 
@@ -538,13 +538,51 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
     import gptsovits_tts as tts
 
     out_dir = out_dir or _HERE
-    res = {"ok": False, "wav": None, "duration": None, "error": None}
+    res = {"ok": False, "wav": None, "duration": None, "error": None,
+           "step": "开始"}
+    _t0 = time.time()
 
     def log(*a):
         if verbose:
             print(*a)
 
+    def mark(step, note=""):
+        """记录当前步骤 —— 失败时能一眼看出卡在哪一步。"""
+        res["step"] = step
+        res["step_elapsed"] = round(time.time() - _t0, 1)
+        if note:
+            res["step_note"] = note
+        return step
+
+    # 0. 前置检查:微信窗口必须存在、而且能拉到最前面。
+    #
+    # ★ 用户实测坑:微信被别的窗口(浏览器/控制面板/任何程序)盖住时,
+    #   本模块的点击是"屏幕绝对坐标",会**点到盖在上面的那个程序**上。
+    #   表现正是用户看到的:
+    #       · 语音"录"了,但发送键**压根没被点到**
+    #       · 鼠标一直停在语音条按钮上,位置不变
+    #   所以开跑前先确认微信能被拉到前台,不能就立刻报错退出,
+    #   绝不带着"会被挡住"的状态去点。
+    mark("预检-微信窗口")
+    _hwnd0 = find_window()
+    if not _hwnd0:
+        res["error"] = "未找到微信窗口(请确认微信已登录且没有最小化)"
+        log("   ✗ " + res["error"])
+        return res
+    if not ws.bring_to_front(_hwnd0):
+        log("       ⚠ 微信未能成为前台窗口,尝试继续(点击时会再做归属校验)")
+    else:
+        log("       微信已置于前台 ✓")
+    if not ws.point_belongs_to(_hwnd0, *anchor_pos(_hwnd0, "voice_btn")):
+        who = ws.window_at(*anchor_pos(_hwnd0, "voice_btn"))
+        res["error"] = ("微信窗口被 %r 遮挡,语音条按钮位置不属于微信。"
+                        "已中止以免误点别的程序 —— 请把微信最大化并点一下微信窗口再试。"
+                        % (ws.window_title(who)[:28] or who))
+        log("   ✗ " + res["error"])
+        return res
+
     # 1. 合成
+    mark("1-合成")
     wav = os.path.join(out_dir, "_voice_send_%d.wav" % int(time.time()))
     log("[1/5] 合成语音 …")
 
@@ -587,6 +625,7 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
     res["wav"] = wav
     res["duration"] = dur
     res["audio"] = ainfo
+    mark("1-合成完成", "时长%.2fs" % dur)
     log("      时长 %.2fs(已修剪开头 %.2fs)" % (dur, ainfo.get("trimmed_head", 0)))
 
     hwnd = find_window()
@@ -596,6 +635,7 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         return res
 
     # 2. 确保目标会话已打开(防 toggle 关闭 + 防发错人)
+    mark("2-打开会话")
     if expect_name:
         log("[2/5] 确保会话「%s」处于打开状态 …" % expect_name)
     else:
@@ -606,7 +646,8 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         import session_guard
         g = session_guard.ensure_chat_open(
             hwnd, row_index, expect_name or "",
-            verbose=verbose, click_fn=ws.click, strict=True)
+            verbose=verbose, click_fn=lambda cx, cy: ws.click(cx, cy, expect_hwnd=hwnd),
+            strict=True)
         if not g.get("ok"):
             res["error"] = ("会话状态无法确认,已中止发送(避免发错人): %s"
                             % g.get("note"))
@@ -623,16 +664,38 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         # session_guard 不可用时,退回原来的直接点击
         log("       [警告] 会话检测不可用(%s),退回直接点击" % str(e)[:60])
         x, y = session_row_pos(hwnd, row_index)
-        ws.click(x, y)
+        ws.click(x, y, expect_hwnd=hwnd)
         time.sleep(1.2)
     if snapshot_prefix:
         _snap(hwnd, "%s_opened.png" % snapshot_prefix)
 
     # 3. 点语音条按钮(开始录音)
+    mark("3-开始录音")
     log("[3/5] 点击语音条按钮 -> 录音")
     vx, vy = anchor_pos(hwnd, "voice_btn")
     log("       坐标 (%d,%d)" % (vx, vy))
-    ok_click = ws.click(vx, vy)
+
+    # 3a. 关键前置检查:微信必须在最前面,且按钮坐标必须真的属于微信。
+    #     ★ 用户实测坑:微信被别的窗口(浏览器/控制面板)盖住时,
+    #       盲点绝对坐标会把点击送到**盖在上面的那个程序**上,
+    #       表现就是"录了音但发送键压根没被点到 / 鼠标停着不动"。
+    if not ws.point_belongs_to(hwnd, vx, vy):
+        who = ws.window_at(vx, vy)
+        log("       ⚠ 按钮坐标当前被别的窗口占用(%s %r),尝试把微信提到前台…"
+            % (who, ws.window_title(who)[:28]))
+        ws.bring_to_front(hwnd)
+        time.sleep(0.4)
+    if not ws.point_belongs_to(hwnd, vx, vy):
+        who = ws.window_at(vx, vy)
+        res["error"] = ("微信窗口没有在最前面,按钮坐标被 %r 挡住 —— 已中止,"
+                        "避免点到别的程序。请把微信窗口点一下/最大化后重试。"
+                        % (ws.window_title(who)[:28] or who))
+        log("   ✗ " + res["error"])
+        if snapshot_prefix:
+            _snap(hwnd, "%s_fail_blocked.png" % snapshot_prefix)
+        return res
+
+    ok_click = ws.click(vx, vy, expect_hwnd=hwnd)
     if not ok_click:
         log("       ⚠ 点击未确认送达,再试一次")
         try:
@@ -640,27 +703,36 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
             time.sleep(0.3)
         except Exception:
             pass
-        ws.click(vx, vy)
+        ws.click(vx, vy, expect_hwnd=hwnd)
     time.sleep(T_RECORD_SETTLE)
 
     # 3b. 确认真的进入录音态(避免后面点了"发送"却发不出去)
     rec, gcount = is_recording(hwnd, verbose=verbose)
     if not rec:
         log("       ⚠ 未检测到录音状态(绿色像素=%d),重试一次" % gcount)
-        ws.click(vx, vy)
+        ws.click(vx, vy, expect_hwnd=hwnd)
         time.sleep(T_RECORD_SETTLE + 0.4)
         rec, gcount = is_recording(hwnd, verbose=verbose)
     if not rec:
-        res["error"] = "进入录音失败(绿色像素=%d,可能没点中语音条按钮)" % gcount
-        log("   ", res["error"])
+        res["error"] = ("进入录音失败(绿色像素=%d)—— 语音条按钮没点中或点击没送到微信"
+                        % gcount)
+        log("   ✗ " + res["error"])
+        if snapshot_prefix:
+            _snap(hwnd, "%s_fail_norecord.png" % snapshot_prefix)
         # 尝试取消,避免残留在录音态
         try:
             cx, cy = anchor_pos(hwnd, "cancel_btn")
-            ws.click(cx, cy)
+            ws.click(cx, cy, expect_hwnd=hwnd)
         except Exception:
             pass
         return res
     log("       ✅ 已进入录音状态(绿色像素=%d)" % gcount)
+
+    # ★ 一进入录音就截图:这样万一后面失败,也能看到当时的真实工具栏,
+    #   而不是只有一个"打开会话"的截图(以前就是这样,查不出失败原因)。
+    if snapshot_prefix:
+        _snap(hwnd, "%s_recording_start.png" % snapshot_prefix)
+
 
     # 3c. 再等一会儿,确保微信的录音管线真正开始取音
     #     实测:点完按钮立刻播放,开头一段会被漏掉。
@@ -671,6 +743,7 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         time.sleep(rec_settle)
 
     # 4. 播放(可选同步录音,便于诊断)
+    mark("4-播放音频")
     log("[4/5] 播放到虚拟线缆 …")
     diag_path = None
     _diag = DIAG_RECORD if diag_record is None else bool(diag_record)
@@ -688,11 +761,13 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
                 log("       ⚠ 线缆上信号极弱,微信可能录不到声音")
     except Exception as e:
         res["error"] = "播放失败: %s" % e
-        log("   ", res["error"])
+        log("   ✗ " + res["error"])
+        if snapshot_prefix:
+            _snap(hwnd, "%s_fail_play.png" % snapshot_prefix)
         # 播放失败要取消录音,避免发出空白语音
         try:
             cx, cy = anchor_pos(hwnd, "cancel_btn")
-            ws.click(cx, cy)
+            ws.click(cx, cy, expect_hwnd=hwnd)
         except Exception:
             pass
         return res
@@ -702,35 +777,47 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
     still, g2 = is_recording(hwnd, verbose=verbose)
     if not still:
         res["error"] = "播放后录音已中断(绿色像素=%d),取消发送" % g2
-        log("   ", res["error"])
+        log("   ✗ " + res["error"])
+        if snapshot_prefix:
+            _snap(hwnd, "%s_fail_recbroken.png" % snapshot_prefix)
         return res
-    if snapshot_prefix:
-        _snap(hwnd, "%s_recording.png" % snapshot_prefix)
+    # 注意:这里**不再**截图。PrintWindow 要 0.3s 左右,而录音还在继续,
+    #       这段等待会变成语音条**结尾的静音**(实测能让 6 秒的话显示成 12 秒)。
+    #       诊断截图已经在刚进入录音时拍过(_recording_start.png)。
 
     # 5. 发送
     #
     # ⚠️ 实测坑:SendInput 可能**静默失败**(前台锁定被拒/焦点被抢),
-    #    表现就是"鼠标动了但没点下去"。这时如果不管,录音会一直持续到
+    #    表现就是"鼠标动了但没点下去"。这里如果不管,录音会一直持续到
     #    微信的 60 秒上限 —— 所以必须:
-    #      ① 点击前确保微信在前台;
+    #      ① 点击前确保微信在前台**且发送键坐标真的属于微信**;
     #      ② 检查 click() 的返回值;
-    #      ③ 点完确认真的退出了录音态,失败则重试(重试前先复位光标到发送键)。
+    #      ③ 点完确认真的退出了录音态,失败则重试。
     log("[5/5] 点击发送")
+    mark("5-点击发送")
     sx, sy = anchor_pos(hwnd, "send_btn")
     log("       坐标 (%d,%d)" % (sx, sy))
 
     sent = False
     for attempt in range(3):
-        # 每次都先把微信拉到前台,降低 SendInput 被丢弃的概率
-        try:
-            ws.bring_to_front(hwnd)
-            time.sleep(0.25)
-        except Exception:
-            pass
+        # 不再无脑抢前台:抢前台本身要 ~0.5s,而录音还在走,
+        # 这段等待会变成语音条结尾的静音。click() 内部的归属校验
+        # 会按需自动抢前台(不需要时立刻返回,几乎不耗时)。
+        if not _user32.GetForegroundWindow() == hwnd:
+            log("       (微信不在前台,点击校验会自动抢回前台)")
 
-        ok_click = ws.click(sx, sy)
+        # 归属校验:发送键坐标必须属于微信,否则这一下会点到别的程序
+        if not ws.point_belongs_to(hwnd, sx, sy):
+            who = ws.window_at(sx, sy)
+            log("       ⚠ 第%d次:发送键坐标被 %r 挡住,重试提前台"
+                % (attempt + 1, ws.window_title(who)[:26] or who))
+            ws.bring_to_front(hwnd)
+            time.sleep(0.3)
+            continue
+
+        ok_click = ws.click(sx, sy, expect_hwnd=hwnd)
         if not ok_click:
-            log("       ⚠ 第%d次点击未确认送达" % (attempt + 1))
+            log("       ⚠ 第%d次点击被阻止或未确认送达" % (attempt + 1))
 
         time.sleep(T_AFTER_SEND)
         left, g = is_recording(hwnd, verbose=verbose)
@@ -742,11 +829,14 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
 
     if not sent:
         # 三次都没成功:尝试取消,避免留下一条 60 秒的超长录音
-        res["error"] = "点击发送失败(3 次),已尝试取消录音"
+        res["error"] = ("点击发送失败(3 次)—— 发送键没点中或点击没送到微信。"
+                        "常见原因:微信窗口没有保持在最前面/被别的窗口遮挡")
         log("   ✗ " + res["error"])
+        if snapshot_prefix:
+            _snap(hwnd, "%s_fail_send.png" % snapshot_prefix)
         try:
             cx, cy = anchor_pos(hwnd, "cancel_btn")
-            ws.click(cx, cy)
+            ws.click(cx, cy, expect_hwnd=hwnd)
             time.sleep(0.6)
         except Exception:
             pass
@@ -762,6 +852,7 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         except Exception:
             pass
     res["ok"] = True
+    mark("完成", "全程 %.1fs" % (time.time() - _t0))
     log("完成 ✅")
     return res
 

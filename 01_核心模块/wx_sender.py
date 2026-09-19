@@ -126,6 +126,90 @@ def bring_to_front(hwnd):
 
 
 # ---------------------------------------------------------------------------
+# 点击归属校验(防点到别的程序上)
+#
+# ⚠️ 血的教训:
+#     原先 click() 是"盲点绝对屏幕坐标"。只要微信不在最前面
+#     (被浏览器 / 控制面板 / 任何窗口盖住),SendInput 的点击就会
+#     落到**盖在上面的那个程序**上 —— 表现为:
+#         · 微信里看起来"录了音",但发送键一次都没被点到
+#         · 鼠标停在语音条按钮上不动
+#         · 更危险:点在别的程序上乱触发
+#     实测:微信被盖住时,(2347,1450)/(2483,1443)/(2129,1444)
+#     三个坐标的 WindowFromPoint 全部指向那个 Chrome 窗口。
+#
+#     所以现在每次点击前都必须确认:
+#       ① 该屏幕坐标确实属于微信窗口;
+#       ② 微信确实是前台窗口;
+#     不满足就先 bring_to_front 重试,仍不满足就**拒绝点击**并报错,
+#     绝不去点别的程序。
+# ---------------------------------------------------------------------------
+
+GA_ROOT = 2
+
+CLICK_GUARD = True          # 关闭后回到老的"盲点"行为(不推荐)
+
+
+def root_of(hwnd):
+    """取窗口的最顶层祖先。"""
+    if not hwnd:
+        return 0
+    return user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+
+
+def window_at(x, y):
+    """屏幕坐标 (x,y) 处最上层窗口的顶层句柄。"""
+    pt = wintypes.POINT(int(x), int(y))
+    h = user32.WindowFromPoint(pt)
+    return root_of(h)
+
+
+def point_belongs_to(hwnd, x, y):
+    """(x,y) 是否属于 hwnd(含其子窗口)。"""
+    return root_of(hwnd) == window_at(x, y)
+
+
+def window_title(hwnd):
+    n = user32.GetWindowTextLengthW(hwnd)
+    if n <= 0:
+        return ""
+    b = ctypes.create_unicode_buffer(n + 2)
+    user32.GetWindowTextW(hwnd, b, n + 2)
+    return b.value
+
+
+def ensure_click_target(hwnd, x, y, tries=3, verbose=False):
+    """确保 (x,y) 属于 hwnd 且 hwnd 在前台。
+
+    返回 (ok, 说明)。ok=False 时调用方**必须放弃点击**。
+    """
+    for i in range(max(1, tries)):
+        fg_ok = user32.GetForegroundWindow() == hwnd
+        own_ok = point_belongs_to(hwnd, x, y)
+        if fg_ok and own_ok:
+            return True, "前台且坐标归属正确"
+        # 不满足 -> 尝试提到前台再验
+        bring_to_front(hwnd)
+        time.sleep(0.2)
+        if verbose:
+            print("       [点击校验] 第%d次: 前台=%s 坐标归属=%s"
+                  % (i + 1, user32.GetForegroundWindow() == hwnd,
+                     point_belongs_to(hwnd, x, y)))
+    fg_ok = user32.GetForegroundWindow() == hwnd
+    own_ok = point_belongs_to(hwnd, x, y)
+    if fg_ok and own_ok:
+        return True, "重试后成功"
+    who = window_at(x, y)
+    if not own_ok:
+        return False, ("坐标 (%d,%d) 被别的窗口占用(窗口句柄 %s %r),"
+                       "不是微信 —— 拒绝点击以免误操作别的程序"
+                       % (x, y, who, window_title(who)[:30]))
+    return False, ("微信 (%s) 不是前台窗口,当前前台是 %s %r —— 拒绝点击"
+                   % (hwnd, user32.GetForegroundWindow(),
+                      window_title(user32.GetForegroundWindow())[:30]))
+
+
+# ---------------------------------------------------------------------------
 # 输入注入(官方 SendInput)
 # ---------------------------------------------------------------------------
 
@@ -165,19 +249,37 @@ def _send(*inputs):
     return user32.SendInput(n, ctypes.byref(arr), ctypes.sizeof(INPUT))
 
 
-def click(x, y, verify=True, settle=0.08):
+def click(x, y, verify=True, settle=0.08, expect_hwnd=None, guard=None):
     """在屏幕绝对坐标点击(移动 + 左键按下抬起)。
 
-    ⚠️ SendInput 会**静默失败**(前台锁定被系统拒绝、焦点被别的进程抢走)。
-       实测表现就是用户看到的"鼠标动了但没点下去"。
+    ⚠️ SendInput 会**静默失败**(前台锁定被系统拒绝、焦点被别的进程抢走),
+       而且**盲点绝对坐标会点到盖在上面的别的程序上**。
        所以这里:
-         · 设置光标后确认它真的到了目标位置;
-         · 检查 SendInput 的返回值(返回事件个数,失败为 0);
-         · 失败时重试一次,并**把结果返回**,由调用方决定是否中止。
+         ① 先做"归属校验":(x,y) 必须属于微信且微信在前台,
+            否则先 bring_to_front 重试,仍不行就**直接拒绝点击**;
+         ② 设置光标后确认它真的到了目标位置;
+         ③ 检查 SendInput 的返回值(返回事件个数,失败为 0);
+         ④ 失败时重试一次,并**把结果返回**,由调用方决定是否中止。
+
+    参数:
+        expect_hwnd: 期望被点的窗口,默认自动取微信主窗口。
+        guard: 覆盖模块级 CLICK_GUARD(True/False/None)。
 
     返回 True/False 表示是否确认点击已送达。
     """
     x, y = int(x), int(y)
+    use_guard = CLICK_GUARD if guard is None else bool(guard)
+
+    if use_guard:
+        tgt = expect_hwnd or find_main_window()
+        if tgt:
+            ok, why = ensure_click_target(tgt, x, y, tries=3, verbose=verify)
+            if not ok:
+                print("  [点击] ✗ 已阻止点击 (%d,%d):%s" % (x, y, why))
+                return False
+        elif verify:
+            print("  [点击] ⚠ 未找到微信窗口,跳过归属校验")
+
     for attempt in range(2):
         user32.SetCursorPos(x, y)
         time.sleep(settle)
@@ -187,6 +289,13 @@ def click(x, y, verify=True, settle=0.08):
         if abs(pt.x - x) > 3 or abs(pt.y - y) > 3:
             time.sleep(0.1)
             continue
+        # 光标到位后再确认一次归属:SetCursorPos 之后窗口可能又变了
+        if use_guard:
+            tgt = expect_hwnd or find_main_window()
+            if tgt and not point_belongs_to(tgt, x, y):
+                print("  [点击] ✗ 光标到位但坐标已属于别的窗口 (%d,%d),放弃本次点击"
+                      % (x, y))
+                return False
         down = INPUT(type=INPUT_MOUSE,
                      u=INPUT_UNION(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, None)))
         up = INPUT(type=INPUT_MOUSE,

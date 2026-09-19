@@ -166,23 +166,30 @@ def _candidate_models():
 #       另:即使 row 填错也**不会发错人** —— 发送前会 OCR 核对标题,
 #          不符就中止本次发送。
 CHATS = {
-    # key 可以填三种,程序都会自动解析成数据库认的 username:
-    #   · 微信号      好友资料页可见(推荐)
-    #   · 昵称/备注   最直观,但对方改名后失效
-    #   · wxid_xxx    最稳,但普通用户看不到
-    'wxid_你的测试号': {
-        "name": '测试号B',        # 必须与微信里显示的一致(发送前用它核对标题)
-        "row": 0,                 # 界面会话列表行号(0 起);配错也能自动纠正
-        "persona": '你是一个名叫小玲的猫娘助手,性格活泼可爱。'
-                   '回答要简短口语化,不超过50字。',
+    # key 可以填三种之一,程序会自动解析:
+    #     wxid(如 wxid_abc123)  /  微信号  /  昵称
+    # 用  python voice_bot.py --list  查看所有会话的真实 username。
+    #
+    # ⚠️ row 是"会话在**界面**列表里的行号"(0 起,置顶会话也算)。
+    #    界面顺序 = 置顶 + 最后消息时间,和 --list 的数据库顺序**不一样**。
+    #    行号会随时间漂移 —— 强烈建议把要自动回复的会话【置顶】,
+    #    这样行号才稳定。即使填错也不会发错人:发送前会 OCR 核对标题。
+    "请填对方的微信号或昵称": {
+        "name": "会话列表里显示的昵称",   # 用于 OCR 核对,防止发错人
+        "row": 0,                          # 界面列表行号(0 起)
+        "enabled": True,                   # False = 临时停用这个角色
+        "persona": (
+            "# 任务\n"
+            "你需要扮演指定角色,根据角色的经历,模仿她的语气进行线上日常对话。\n\n"
+            "# 角色\n"
+            "在这里写角色设定……\n\n"
+            "# 输出要求\n"
+            "回答尽量简短,控制在 30 字以内。使用中文。\n"
+            "只输出语言,不要旁白/括号动作。\n"
+        ),
     },
-    # 想停用但保留配置,加 "enabled": False
-    # 'filehelper': {
-    #     "name": '文件传输助手', "row": 1, "enabled": False,
-    #     "persona": '...',
-    # },
+    # 想加第二个角色就复制上面这段,改 key / name / row / persona。
 }
-
 
 
 # ---- 运行参数 -------------------------------------------------------------
@@ -190,6 +197,60 @@ POLL_INTERVAL = 3.0      # 轮询间隔(秒)
 MAX_REPLY_CHARS = 60     # 超过此长度不转语音(语音条不适合太长)
 SEND_TEXT_TOO = False    # 是否同时发一条文字(False = 只发语音条)
 SNAPSHOT_DIR = os.path.join(ROOT, "05_文档", "发送截图")
+LOG_DIR = os.path.join(ROOT, "05_文档", "运行日志")
+
+
+class _Tee(object):
+    """把输出同时写到控制台和日志文件。
+
+    ★ 为什么要落盘:
+        以前失败后**没有任何日志**,只能靠"哪个截图/哪个 wav 文件存在"
+        去猜卡在哪一步,非常费劲。现在每轮运行都会写一份日志,
+        出问题直接看日志最后几十行就知道是第几步、什么原因。
+    """
+
+    def __init__(self, *streams):
+        self.streams = [s for s in streams if s is not None]
+
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
+_LOG_PATH = None
+
+
+def start_logging():
+    """开始记录运行日志,返回日志文件路径(失败返回 None)。"""
+    global _LOG_PATH
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        p = os.path.join(LOG_DIR, "voicebot_%s.log" % time.strftime("%Y%m%d"))
+        f = open(p, "a", encoding="utf-8", buffering=1)
+        f.write("\n" + "=" * 74 + "\n")
+        f.write("启动 %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        f.write("=" * 74 + "\n")
+        sys.stdout = _Tee(sys.stdout, f)
+        sys.stderr = _Tee(sys.stderr, f)
+        _LOG_PATH = p
+        return p
+    except Exception:
+        return None
 
 # 音频留存:每 N 次发送后自动清理一次(None/0 = 不自动清理)
 AUTO_CLEAN_EVERY = 5
@@ -572,7 +633,10 @@ def run_once(db, state, live):
                     _sent_counter["n"] += 1
                     maybe_cleanup(_sent_counter["n"])
                 else:
-                    print("  ❌ 发送失败: %s" % r.get("error"))
+                    print("  ❌ 发送失败 [卡在: %s] %s"
+                          % (r.get("step") or "?", r.get("error")))
+                    print("     排查:查看 05_文档\\发送截图\\ 里最新的 _fail_*.png,") 
+                    print("           以及 05_文档\\运行日志\\ 里当天的日志")
             else:
                 print("  [DRY-RUN] 将发送语音: %s" % voice_text)
 
@@ -663,10 +727,17 @@ def main():
                     help="清空水位记录(下次会重新处理最近消息)")
     args = ap.parse_args()
 
+    # 开始记录日志(所有 print 会同时写入 05_文档\运行日志\)
+    _lp = start_logging()
+
     print("=" * 74)
     print("  微信语音自动回复")
     print("  模式: %s" % ("【实际发送】" if args.live else "【DRY-RUN 只演练】"))
     print("=" * 74)
+    if _lp:
+        print("  运行日志: %s" % _lp)
+        print("  (失败时把日志最后 30 行发给开发者,即可定位问题)")
+    print()
 
     # 前提检查
     #
@@ -788,6 +859,7 @@ def main():
         print("已停止。")
     finally:
         save_state(state)
+        print("结束 %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
 
 
 if __name__ == "__main__":
