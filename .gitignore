@@ -39,6 +39,15 @@ libs/
 voice_bot_state.json
 *.log
 
+# 本地个人配置(含真实微信号/昵称,不进仓库)
+voice_bot_config.local.py
+*.local.py
+
+# 参考音频配置(因人而异,用 02_工具面板/set_reference.py 各自生成)
+reference_config.json
+# 参考音频本身(体积大,且属个人素材)
+参考音频/
+
 # ---- 模型权重(极大,单独管理) ----
 *.ckpt
 *.pth

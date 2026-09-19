@@ -54,10 +54,16 @@ if not os.path.isdir(PROJECT):
     print("预期结构: 桌面/WeChatBot_WXAUTO_SE-3.28")
     sys.exit(1)
 
-# 核心模块优先(用本目录的副本),再补项目与 vendor
-for p in (CORE, PROJECT, os.path.join(PROJECT, "vendor_py")):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+# ⚠️ 路径优先级很重要:
+#    insert(0) 是"插到最前",所以**后插入的优先级更高**。
+#    并且 WeChatBot 项目里存在同名旧副本(如 gptsovits_tts.py),
+#    若它的优先级高于 CORE,就会把新版模块覆盖掉 —— 实测踩过这个坑
+#    (改动不生效,一直在用旧代码)。
+#    因此这里显式按"从低到高"的顺序插入,最终 CORE 优先级最高。
+for _p in (os.path.join(PROJECT, "vendor_py"), PROJECT, CORE):
+    while _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
 
 STATE_FILE = os.path.join(ROOT, "voice_bot_state.json")
 
@@ -91,36 +97,97 @@ AI_KEY = os.environ.get("VOICE_BOT_KEY") or AI["api_key"]
 AI_BASE = AI["base_url"]
 AI_MODEL = AI["model"]
 
-# 备用模型:config.py 里的模型若已失效(OpenRouter 常下架模型),
-# 自动依次回退。实测这几个在 2026-09-19 可用。
+# 备用模型:config.py 里的模型若失效时依次回退。
+#
+# ⚠️ 坑:不同服务商的**模型名格式不同**!
+#     OpenRouter  ->  "deepseek/deepseek-v4-pro"   (带 vendor 前缀)
+#     DeepSeek官方 ->  "deepseek-v4-pro"            (不带前缀)
+#     硅基流动     ->  "deepseek-ai/DeepSeek-V3"
+#   写死一份名单会在别的服务商上**全部失效**(实测:
+#   把 OpenRouter 的名单用在 api.deepseek.com 上,
+#   报 "The supported API model names are ..." → 所有模型不可用)。
+#
+# 因此改为:优先**查询服务商真实支持的模型列表**,再从中挑。
 AI_MODEL_FALLBACKS = [
+    # 通用兜底(不带前缀,适配 DeepSeek 官方等多数兼容端点)
+    "deepseek-v4-pro",
+    "deepseek-flash",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    # OpenRouter 风格(仅在该服务商上有效,失败会被跳过)
     "deepseek/deepseek-v3.2",
     "deepseek/deepseek-v4-pro",
-    "deepseek/deepseek-chat-v3.1",
 ]
 _working_model = {"id": None}
 
+
+def _discover_models():
+    """查询服务商实际支持的模型 ID 列表;失败返回 []。
+
+    这样就不用猜模型名 —— 直接用它告诉我们能用的。
+    """
+    try:
+        from openai import OpenAI
+        c = OpenAI(api_key=AI_KEY, base_url=AI_BASE)
+        return [m.id for m in c.models.list().data]
+    except Exception as e:
+        print("  [AI] 无法查询模型列表(%s),将按候选名单逐个试" % str(e)[:70])
+        return []
+
+
+def _candidate_models():
+    """组装候选模型:配置的模型 -> 服务商真实列表 -> 通用兜底。"""
+    cands = []
+    if AI_MODEL:
+        cands.append(AI_MODEL)
+    for mid in _discover_models():
+        if mid not in cands:
+            cands.append(mid)
+    for mid in AI_MODEL_FALLBACKS:
+        if mid not in cands:
+            cands.append(mid)
+    return cands
+
 # ---- 要自动回复的会话 -----------------------------------------------------
-#   key   = 微信会话标识(filehelper 或 wxid_xxx,用 --list 查看)
+# ---- 要自动回复的会话 -----------------------------------------------------
+#   key   = 会话标识。**三种写法都可以,程序会自动解析**:
+#             · wxid_xxx     最稳(永不变),但普通用户看不到
+#             · 微信号        好友资料页可见,直观
+#             · 昵称/备注      最直观,但对方改了名就失效
+#           (微信数据库里消息按 wxid 存,所以内部会先解析成 wxid)
 #   value = {"name": 显示名, "row": 会话列表第几行(0起), "persona": 角色设定}
+#           ⚠️ name 必须与微信里显示的名字一致 —— 发送前要用它 OCR 核对标题
 #
 #   ⚠️⚠️ row 是"会话列表从上往下的行号",**会随聊天活跃度变化**!
 #       发错人的风险由此而来。降低风险:
 #         1) 把要自动回复的对象【置顶】(置顶会话在最前,行号稳定)
-#         2) 改动后跑 `python voice_bot.py --list` 核对
-#         3) 发送前脚本会截图存档(voice_bot_shots/),可回查
+#         2) 用 voice_bot.py --list 看当前打开的会话,对照界面校准
+#         3) 发送前脚本会截图存档(05_文档\发送截图),可回查
+#       另:即使 row 填错也**不会发错人** —— 发送前会 OCR 核对标题,
+#          不符就中止本次发送。
 CHATS = {
+    # key 可以填三种东西,程序都会自动解析成数据库认的 username:
+    #   · 微信号      好友资料页可见(推荐)
+    #   · 昵称/备注   最直观,但对方改名后失效
+    #   · wxid_xxx    最稳,但普通用户看不到
+    'wxid_你的测试号': {
+        "name": '测试号B',          # 必须与微信里显示的名字一致(发送前用它核对标题)
+        "row": 1,                   # 界面会话列表的行号(0 起)
+        "persona": '你是一个名叫小玲的猫娘助手,性格活泼可爱。'
+                   '回答要简短口语化,不超过50字。',
+    },
+    # 文件传输助手是系统会话,名称固定
     'filehelper': {
         "name": '文件传输助手',
-        "row": 1,
-        "persona": '你是一个名叫小玲的猫娘助手,性格活泼可爱。回答要简短口语化,不超过50字。',
-    },
-    'wxid_你的测试号': {
-        "name": '测试号B',
         "row": 0,
-        "persona": '你是一个名叫小玲的猫娘助手,性格活泼可爱。回答要简短口语化,不超过50字。',
+        "persona": '你是一个助手,回答简短一些。',
     },
+    # 想停用但保留配置,加 "enabled": False
+    # 'wxid_xxxxxxxxxxxxxxxx': {
+    #     "name": '某个会话', "row": 2, "enabled": False, "persona": '...',
+    # },
 }
+
 
 # ---- 运行参数 -------------------------------------------------------------
 POLL_INTERVAL = 3.0      # 轮询间隔(秒)
@@ -192,18 +259,132 @@ def save_state(st):
         print("[警告] 保存状态失败:", e)
 
 
-def fetch_new(db, chat_key, state, self_name=None):
+def resolve_chat_key(db, key, name=None):
+    """把 CHATS 的 key 解析成数据库真正认的 username。
+
+    为什么需要:
+        微信数据库里消息是按 **wxid**(如 wxid_xxxxxxxxxxxxxxxx)存的。
+        但 wxid 普通用户看不到(要读数据库才有),所以 CHATS 的 key
+        允许填**看得见的东西**:昵称、备注、或微信号。
+        这里负责把它解析成真正的 wxid。
+
+    解析顺序(逐个试,命中即返回):
+        1. 本身就能查到昵称且不是自指  -> 已是有效 username
+        2. username_by_nickname(name/昵称/微信号)
+        3. search_contact(name/昵称/微信号) 取 username
+        4. 自扫会话列表做名字匹配
+
+    解析结果会缓存,避免重复查库。
+    """
+    cache = getattr(resolve_chat_key, "_cache", None)
+    if cache is None:
+        cache = {}
+        resolve_chat_key._cache = cache
+    ck = (key, name)
+    if ck in cache:
+        return cache[ck]
+
+    def _ok(u):
+        """确认 u 是数据库认的 username(能取到非自指昵称,或能取到消息)。"""
+        if not u:
+            return False
+        try:
+            n = db.get_nickname(u) or ""
+        except Exception:
+            n = ""
+        if n and n != u:
+            return True
+        try:
+            return len(db.get_messages(u, limit=1)) > 0
+        except Exception:
+            return False
+
+    # 1) key 本身
+    if _ok(key):
+        cache[ck] = key
+        return key
+
+    cands = []
+    for want in (name, key):
+        if want and want not in cands:
+            cands.append(want)
+
+    # 2) 按昵称查
+    for want in cands:
+        try:
+            u = db.username_by_nickname(want)
+            if _ok(u):
+                print("  [解析] %r -> %s (按昵称)" % (key, u))
+                cache[ck] = u
+                return u
+        except Exception:
+            pass
+
+    # 3) 模糊搜联系人
+    for want in cands:
+        try:
+            for c in (db.search_contact(want) or []):
+                u = c.get("username") if isinstance(c, dict) else None
+                nm = (c.get("nick_name") or c.get("remark") or "") if isinstance(c, dict) else ""
+                # 名字要能对上,避免搜出无关的人
+                if u and (want in (nm or "") or (nm or "") in want or _ok(u)):
+                    if _ok(u):
+                        print("  [解析] %r -> %s (搜联系人)" % (key, u))
+                        cache[ck] = u
+                        return u
+        except Exception:
+            pass
+
+    # 4) 自扫会话列表
+    try:
+        for s in db.get_sessions(limit=50):
+            u = s.get("username")
+            try:
+                nm = db.get_nickname(u) or ""
+            except Exception:
+                nm = ""
+            if want_matches(nm, cands) and _ok(u):
+                print("  [解析] %r -> %s (扫会话列表)" % (key, u))
+                cache[ck] = u
+                return u
+    except Exception:
+        pass
+
+    print("  [解析] ⚠ 无法把 %r 解析成有效 username,将按原样使用" % key)
+    cache[ck] = key
+    return key
+
+
+def want_matches(nick, wants):
+    """昵称与任一候选是否匹配(去空格后互相包含)。"""
+    n = "".join((nick or "").split())
+    if not n:
+        return False
+    for w in wants:
+        w2 = "".join((w or "").split())
+        if w2 and (w2 in n or n in w2):
+            return True
+    return False
+
+
+def fetch_new(db, chat_key, state, self_name=None, display_name=None):
     """取该会话的新消息(只取对方发来的文本)。
 
     注意 sender_id 语义:实测 1 = 自己。这里只用它做粗过滤,
     同时用发送者昵称二次确认(防止把自己发的当成对方消息 → 自问自答死循环)。
+
+    chat_key 可以是 wxid / 昵称 / 微信号,内部会解析成数据库认的 username。
     """
+    real = resolve_chat_key(db, chat_key, display_name)
+    if real != chat_key:
+        print("  [会话] key %r 解析为 %r" % (chat_key, real))
     try:
-        msgs = db.get_messages(chat_key, limit=20)
+        msgs = db.get_messages(real, limit=20)
     except Exception as e:
         print("  [读取失败] %s: %s" % (chat_key, e))
         return []
 
+    # 水位按 key 记(而不是解析后的 wxid),这样改 key 也不会重发
     last_ts = state.get(chat_key, {}).get("last_create_time", 0)
     fresh = []
     for m in msgs:
@@ -247,7 +428,7 @@ def ai_reply(persona, user_text, history=None):
             return out
 
     tried = []
-    for mid in [AI_MODEL] + AI_MODEL_FALLBACKS:
+    for mid in _candidate_models():
         if not mid or mid in tried:
             continue
         tried.append(mid)
@@ -264,7 +445,12 @@ def ai_reply(persona, user_text, history=None):
             print("  [AI] %s 返回空内容,换下一个" % mid)
         except Exception as e:
             print("  [AI] %s 失败: %s" % (mid, str(e)[:120]))
-    raise RuntimeError("所有模型均不可用,请检查 AI 配置或额度")
+    raise RuntimeError(
+        "所有模型均不可用(共试了 %d 个)。请检查:\n"
+        "    1. API Key 是否有效/有额度\n"
+        "    2. 模型名格式是否匹配服务商(OpenRouter 要 'deepseek/xxx',\n"
+        "       DeepSeek 官方要 'deepseek-xxx',不能混用)\n"
+        "    3. config.py 里的 DEEPSEEK_BASE_URL 是否正确" % len(tried))
 
 
 def clean_for_voice(text):
@@ -359,7 +545,7 @@ def run_once(db, state, live):
         if cfg.get("enabled") is False:
             continue
         name = cfg.get("name") or chat_key
-        fresh = fetch_new(db, chat_key, state)
+        fresh = fetch_new(db, chat_key, state, display_name=name)
         if not fresh:
             continue
         for item in fresh:
@@ -403,12 +589,17 @@ def run_once(db, state, live):
 
 
 def list_chats(db):
-    """列出所有会话,方便填写 CHATS 配置。"""
+    """列出所有会话,方便填写 CHATS 配置。
+
+    ⚠️ 重要:本列表的顺序来自**数据库**(按最后消息时间),
+       而微信**界面**的顺序是「置顶 + 时间」—— 两者**并不一致**。
+       所以下面这个「行」号**不能直接当成 CHATS 的 row**!
+    """
     print()
     print("=" * 78)
     print("会话列表(把 username 填到 CHATS 的 key)")
     print("=" * 78)
-    print("  %-3s %-32s %-13s %-6s %s" % ("行", "username", "昵称", "消息", "已配置"))
+    print("  %-3s %-32s %-13s %-6s %s" % ("序", "username", "昵称", "消息", "已配置"))
     print("  " + "-" * 74)
     try:
         sessions = db.get_sessions(limit=30)
@@ -433,10 +624,32 @@ def list_chats(db):
             else:
                 mark = "✅ 会回复"
         print("  %-3d %-32s %-13s %-6s %s" % (i, u, str(nick)[:13], n, mark))
+
+    # 顺便读出当前打开的是哪个会话,帮助校准
+    cur_title = ""
+    try:
+        import session_guard
+        import wx_sender
+        h = wx_sender.find_main_window()
+        if h:
+            _, cur_title = session_guard.read_chat_title(h)
+    except Exception:
+        pass
+
     print()
-    print("  提示:")
-    print("    · row 就是上面的「行」号;建议把常聊对象【置顶】以固定行号")
-    print("    · 用 Web UI 配置角色更直观:python character_webui.py")
+    print("  ⚠️ 注意:上面「序」号来自数据库(按最后消息时间排序),")
+    print("     与微信界面的行号(置顶+时间)**不一致**,不能直接当 row 用!")
+    print()
+    print("  怎么确定界面行号:")
+    print("    1) 把目标会话在微信里【置顶】—— 置顶后它就在列表最前")
+    print("       两个目标就占第 0、1 行,顺序稳定")
+    if cur_title:
+        print("    2) 当前微信打开的会话是「%s」" % cur_title)
+        print("       在界面上看它在第几行,那就是它的 row")
+    print("    3) 拿不准就靠程序自带的【会话标题校验】兜底:")
+    print("       发错行时它会 OCR 出标题不符 -> 中止发送(不会发错人)")
+    print()
+    print("  另:用 Web UI 配置角色更直观 → python character_webui.py")
     print("      (或控制面板 → ⑦ 角色配置 Web UI)")
 
 
@@ -518,6 +731,21 @@ def main():
             print("  ✗ AI 自检失败: %s" % e)
             print("    请检查 config.py 里的 DEEPSEEK_API_KEY / BASE_URL / MODEL")
             ok = False
+
+    # 如果 TTS 在线,主动把权重设成配置的那对
+    # (api_v2.py 会把 tts_infer.yaml 的 version 改写成 v1,不能只靠配置文件)
+    if ok:
+        try:
+            import gptsovits_tts as _tts
+            if _tts.is_server_alive():
+                print()
+                print("TTS 权重自检:")
+                w_ok, _msg = _tts.ensure_weights(verbose=True)
+                if not w_ok:
+                    print("  ⚠ 权重设置未完全成功 —— 音色可能不对")
+        except Exception as e:
+            print("  (TTS 权重自检跳过: %s)" % str(e)[:60])
+
     print()
     if not ok:
         print("前提不满足,退出。请先修正上面的问题。")

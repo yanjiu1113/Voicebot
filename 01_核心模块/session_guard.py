@@ -40,8 +40,15 @@ TITLE_BOX = (540, 78, 950, 132)
 
 # 会话列表行背景采样区(x 范围取会话名所在的行背景)
 ROW_SAMPLE_X = (110, 500)
-ROW_CENTER_Y0 = 213          # 第 0 行中心
-ROW_PITCH = 90               # 行距
+# ⚠️ 行位置为**实测标定**(2026-09-19,窗口 2584x1540):
+#      row0 = 文件传输助手  y≈208
+#      row1 = 会话B      y≈275
+#      row3 = 会话C      y≈409
+#      row4 = Woo          y≈476
+#    => 行距 67(不是旧的 90!),首行中心 208。
+#    旧值 90 会让 row>=2 偏移 40+ 像素,点到行间空白。
+ROW_CENTER_Y0 = 208          # 基准尺寸下第 0 行中心
+ROW_PITCH = 67               # 行距(实测)
 
 # 微信活动会话行绿色(实测主色 (21,172,112),另见 (0,195,117))
 WX_GREENS = ((21, 172, 112), (0, 195, 117), (7, 193, 96), (26, 173, 117))
@@ -156,7 +163,11 @@ def read_chat_title(hwnd, debug=False):
 
 
 def is_row_highlighted(hwnd, row, debug=False):
-    """判断会话列表第 row 行是否为活动(高亮)行。"""
+    """判断会话列表第 row 行是否为活动(高亮)行。
+
+    row 是**界面行号**(0 起),坐标以截图为基准换算,与窗口在屏幕上的
+    位置无关 —— 实测窗口原点为 (-12,-12) 时依然正确。
+    """
     img, _ = _grab(hwnd)
     w, h = img.size
     sy = h / float(BASE_H)
@@ -184,25 +195,87 @@ def is_row_highlighted(hwnd, row, debug=False):
 # 主入口:确保目标会话已打开(不误关)
 # ---------------------------------------------------------------------------
 
+def open_chat_by_search(hwnd, name, verbose=True, settle=1.2, max_retry=2):
+    """用左上角搜索框打开会话 —— 不依赖行号,最可靠。
+
+    为什么需要它:
+        会话列表的行号会随聊天活跃度变化(而且 `--list` 的编号是按
+        "最后消息时间"排的,与界面"置顶+时间"的顺序**并不一致**),
+        所以只靠 row 定位有发错人的风险。
+
+    流程: 点搜索框 -> 粘贴名字 -> 回车 -> OCR 核对标题
+
+    Returns: dict {ok, action, by, title, note}
+    """
+    import wx_sender as ws
+
+    def log(*a):
+        if verbose:
+            print(*a)
+
+    res = {"ok": False, "action": None, "by": None, "title": "", "note": ""}
+    target = _norm(name)
+    if not target:
+        res["note"] = "未提供会话名,无法搜索"
+        return res
+
+    # 已经是目标会话就不动(避免 toggle 关闭)
+    _, t = read_chat_title(hwnd, debug=False)
+    if t and target in t:
+        log("  [搜索] 标题已匹配「%s」-> 跳过" % t)
+        res.update(ok=True, action="skip", by="ocr", title=t)
+        return res
+
+    try:
+        L = ws.Layout(hwnd)
+        sx, sy = L.search_box()
+    except Exception as e:
+        res["note"] = "无法获取搜索框坐标: %s" % str(e)[:60]
+        return res
+
+    log("  [搜索] 点搜索框 (%d,%d) 并输入「%s」" % (sx, sy, name))
+    for attempt in range(max_retry):
+        ws.click(sx, sy)
+        time.sleep(0.45)
+        ws.type_text(name)           # 剪贴板粘贴,避免输入法干扰
+        time.sleep(0.7)
+        ws.press_enter()
+        time.sleep(settle)
+
+        _, t = read_chat_title(hwnd, debug=False)
+        if t and target in t:
+            log("  [搜索] 打开成功,标题确认「%s」✅" % t)
+            res.update(ok=True, action="search", by="ocr", title=t)
+            return res
+        log("  [搜索] 第%d次尝试后标题为「%s」,与目标不符" % (attempt + 1, t or "?"))
+
+    res["note"] = ("搜索「%s」后标题未匹配(读到「%s」)" % (name, t or "空"))
+    return res
+
+
 def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
-                     settle=1.2, max_retry=2):
+                     settle=1.2, max_retry=2, strict=True, method="auto"):
     """确保「name」对应的会话处于打开状态。
+
+    strict=True(默认):无法确认会话状态时返回 ok=False,由调用方中止发送。
+                       宁可这条不发,也不能发错人。
+    strict=False       :沿用旧的"保守继续"行为(不推荐)。
 
     核心逻辑(解决 toggle 关闭问题):
         1. 先读当前聊天标题
         2. 若已是目标会话  -> 【不点击】直接返回
-        3. 否则            -> 点击第 row 行,再确认
-        4. OCR 读不出时    -> 回退用"第 row 行是否高亮"判断
-        5. 仍无法确认      -> 保守:按正常流程点击(避免发到当前会话)
+        3. 否则点击目标行  -> 读标题确认;读不出再查该行是否高亮
+        4. 仍无法确认      -> strict 时判失败
 
     Args:
         click_fn: 可调用对象,签名 f(x, y) 执行一次点击
         settle: 点击/切换后等待秒数
+        strict: 无法确认时是否判失败(默认 True)
 
     Returns:
         dict: {ok, action, by, title, note}
-            action: 'skip' 未点击 / 'click' 已点击
-            by:     'ocr' / 'highlight' / 'fallback'
+            action: 'skip'(未点击) / 'click'(已点击) / 'abort'(中止)
+            by:     'ocr' / 'highlight' / 'none'
     """
     if click_fn is None:
         import wx_sender
@@ -238,6 +311,23 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
         log("  [会话] 第%d行未高亮(%.0f%%)-> 点击" % (row, frac * 100))
 
     # --- 3. 点击打开 ---
+    #
+    # 行号会漂移,而且 `--list` 的编号(按最后消息时间)与界面顺序
+    # (置顶+时间)**并不一致**。所以在点行之前,先用搜索框定位 ——
+    # 搜索是按名字找,不依赖行号,可靠得多。
+    if target and method in ("auto", "search"):
+        s = open_chat_by_search(hwnd, name, verbose=verbose, settle=settle,
+                                max_retry=max(1, max_retry - 1))
+        if s.get("ok"):
+            res.update(ok=True, action="search", by=s.get("by"), title=s.get("title"))
+            return res
+        log("  [搜索] 未成功(%s)" % s.get("note"))
+        if method == "search":
+            res.update(ok=False, action="abort", by="none",
+                       note="搜索定位失败: %s" % s.get("note"))
+            return res
+        log("  [会话] 退回按行号点击")
+
     import wx_voice_sender as vS
     x, y = vS.session_row_pos(hwnd, row)
     for attempt in range(max_retry):
@@ -251,7 +341,9 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
             res.update(ok=True, action="click", by="ocr", title=t)
             return res
         if t:
-            log("  [会话] 点击后标题为「%s」,与目标不符" % t)
+            # 标题能读出但与目标不符 -> 说明行号已经漂移,重试同一行没意义
+            log("  [会话] 点击后标题为「%s」,与目标不符 -> 行号可能已漂移" % t)
+            break
         else:
             hl, frac = is_row_highlighted(hwnd, row, debug=False)
             if hl:
@@ -260,10 +352,18 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
                 return res
             log("  [会话] 点击后仍无法确认(第%d次)" % (attempt + 1))
 
-    # --- 4. 保守:OCR 读不出时按正常流程处理 ---
-    log("  [会话] ⚠ 无法确认会话状态,保守继续(按已打开处理,不再点击)")
-    res.update(ok=True, action="click", by="fallback",
-               note="无法确认会话状态,已按保守策略继续")
+    # --- 4. 两条验证都失败 ---
+    #
+    # 重要:此时我们**不知道当前打开的是哪个会话**。
+    # 如果继续发语音条,可能发到错误的人那里 —— 这个代价远大于"不发"。
+    # 因此默认返回失败,由调用方中止本次发送。
+    #
+    # (早期版本这里返回 ok=True 并"保守继续",那是错的:
+    #  它把"无法确认"当成了"安全",实际是最高风险的时刻。)
+    log("  [会话] ✗ 无法确认会话状态(OCR 读不出标题,第%d行也未高亮)" % row)
+    log("         为安全起见中止本次发送,避免发错人")
+    res.update(ok=False, action="abort", by="none",
+               note="无法确认会话状态(OCR 与高亮校验均失败),已中止发送")
     return res
 
 

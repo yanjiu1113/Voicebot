@@ -71,7 +71,26 @@ _CABLE_API_PREFER_REC = ("Windows DirectSound", "Windows WASAPI", "MME")
 CABLE_PLAY_DEVICE = None
 CABLE_REC_DEVICE = None
 CABLE_RATE = 48000
-DIAG_RECORD = True          # 发送时同步录音,便于诊断微信录到了什么
+# 诊断:播放时同步采集线缆,存成 *_cable.wav
+#
+# ⚠️ 它需要**打开与微信相同的录音端点**。两个程序同时占用一个
+#    DirectSound 录音端点是可疑的 —— 怀疑会干扰微信取音,
+#    表现为"发出空语音条"。
+#
+#    因此**默认关闭**。排查问题时再改 True(会生成 *_cable.wav,
+#    能直接看到线缆上到底有没有声音)。
+DIAG_RECORD = False
+
+# 发送前的音频校验/处理参数
+# 实测:线缆底噪峰值=1,正常语音峰值 20000+,
+#       所以峰值 < 300 基本可断定是静音(会发出空语音条)。
+CABLE_SILENT_PEAK = 300     # 低于此峰值判为"静音",拒发
+CABLE_TARGET_PEAK = 20000   # 归一化目标(提升过轻的音频,避免听着发闷)
+
+
+class SilentAudio(Exception):
+    """TTS 返回的音频为空/极弱 —— 不应该发出去。"""
+
 
 _cable_cache = {}
 
@@ -150,9 +169,9 @@ def cable_devices(refresh=False):
     return p, r
 
 # 界面坐标(窗口内比例,0~1;相对整个窗口,非渲染区)
-RATIO_SESSION_X = 0.122     # 会话列表行的 x
-RATIO_SESSION_Y0 = 0.143    # 第 1 行 y(文件传输助手)
-RATIO_SESSION_DY = 0.0435   # 行间距
+RATIO_SESSION_X = 0.117     # 会话列表行的 x(实测点 (303, y) 能命中)
+RATIO_SESSION_Y0 = 0.135    # 第 0 行(文件传输助手)中心 y —— 实测 208/1540
+RATIO_SESSION_DY = 0.0435   # 行间距 —— 实测 67/1540 ≈ 0.0435
 
 # ---------------------------------------------------------------------------
 # 语音模式按钮坐标 —— 实测标定(不要再用比例推算!)
@@ -177,7 +196,9 @@ REC_GREEN_MIN = 800         # 绿色像素数超过此值视为"正在录制"
 TOOLBAR_Y_RATIO = 0.88      # 工具栏区起始 y 比例
 
 # 时序(秒)
-T_RECORD_SETTLE = 0.8       # 点录音后等待录音真正启动
+T_RECORD_SETTLE = 0.8       # 点录音后等待录音真正启动(用于状态检测)
+T_REC_SETTLE_AFTER = 1.2    # 确认进入录音态后,再等这么久才播放
+                            # 实测:立刻播放会让开头一段丢失
 T_TAIL = 1.0                # 播完后留的尾巴(避免截断)
 T_AFTER_SEND = 2.0
 
@@ -302,16 +323,68 @@ def _resample(x, src, dst):
     return (x[lo] * (1 - fr) + x[hi] * fr).astype(np.int16)
 
 
-def load_for_cable(wav_path):
-    """读 WAV 并转成虚拟线缆需要的 48k 立体声。"""
+def load_for_cable(wav_path, trim_silence=True, verbose=False):
+    """读 WAV -> 校验 -> 修剪首尾静音 -> 转成线缆需要的 48k 立体声。
+
+    返回 (stereo, 时长秒, 信息dict);音频为空则抛 SilentAudio 异常。
+
+    为什么需要校验:
+        实测 TTS 偶发返回静音/极弱音频(线缆录音峰值=1),
+        旧代码照单全收 -> 发出**空语音条**。
+        这里先判空,宁可本次不发,也不发空语音。
+    """
     import numpy as np
     with wave.open(wav_path, "rb") as w:
         rate, ch = w.getframerate(), w.getnchannels()
         raw = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    if raw.size == 0:
+        raise SilentAudio("TTS 返回空音频(0 采样)")
     if ch > 1:
         raw = raw.reshape(-1, ch).mean(axis=1).astype(np.int16)
+
+    peak = int(np.max(np.abs(raw)))
+    rms = float(np.sqrt(np.mean(raw.astype(np.float64) ** 2)))
+
+    if peak < CABLE_SILENT_PEAK:
+        raise SilentAudio(
+            "TTS 音频几乎无声(峰值 %d, RMS %.1f)—— 不发空语音" % (peak, rms))
+
+    # 修剪首尾静音:去掉开头那段空白(实测会占 1 秒以上)
+    trimmed = 0.0
+    if trim_silence and peak > 0:
+        thr = max(peak * 0.04, 60)
+        loud = np.abs(raw) > thr
+        idx = np.where(loud)[0]
+        if len(idx):
+            # 留 0.05 秒余量,避免削掉字头
+            pad = int(rate * 0.05)
+            a0 = max(0, idx[0] - pad)
+            a1 = min(len(raw), idx[-1] + pad)
+            trimmed = a0 / float(rate)
+            raw = raw[a0:a1]
+        else:
+            raise SilentAudio("音频无有效语音段")
+
+    if raw.size == 0:
+        raise SilentAudio("修剪后无音频")
+
     a = _resample(raw.astype(np.float64), rate, CABLE_RATE)
-    return np.repeat(a.reshape(-1, 1), 2, axis=1), len(a) / float(CABLE_RATE)
+
+    # 音量归一化:提升过轻的音频,避免微信端听起来发闷
+    p2 = float(np.max(np.abs(a))) if a.size else 0.0
+    if p2 > 0 and p2 < CABLE_TARGET_PEAK * 0.7:
+        gain = min(CABLE_TARGET_PEAK / p2, 4.0)
+        a = a * gain
+        if verbose:
+            print("       [音频] 增益 x%.2f (原峰值 %.0f)" % (gain, p2))
+    a = np.clip(a, -32768, 32767).astype(np.int16)
+
+    info = {"peak_in": peak, "rms_in": rms, "trimmed_head": trimmed,
+            "peak_out": int(np.max(np.abs(a))) if a.size else 0}
+    if verbose:
+        print("       [音频] 原峰值 %d RMS %.0f -> 修剪掉开头 %.2fs, 输出峰值 %d" % (
+            peak, rms, trimmed, info["peak_out"]))
+    return np.repeat(a.reshape(-1, 1), 2, axis=1), len(a) / float(CABLE_RATE), info
 
 
 def play_to_cable(stereo, record_to=None):
@@ -366,7 +439,9 @@ def play_to_cable(stereo, record_to=None):
 # ---------------------------------------------------------------------------
 
 def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
-                      verbose=True, snapshot_prefix=None, expect_name=None):
+                      verbose=True, snapshot_prefix=None, expect_name=None,
+                      wait_tts_ready=True, tts_wait=180,
+                      diag_record=None, rec_settle=None):
     """向会话列表第 row_index 行(0 起)发送一条语音条。
 
     Args:
@@ -375,6 +450,14 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         expect_name: 期望的会话名(如"测试号B")。提供时会用它做
                      OCR 标题校验,避免因行号漂移而发错人。
         out_dir: 临时文件目录
+        wait_tts_ready: 合成前先等 TTS **真正就绪**(端口+模型都可用)。
+                        设为 False 可跳过(不推荐)。
+        diag_record: 是否在播放时同步采集线缆(诊断用)。
+                     ⚠️ 它会和微信**同时打开同一个录音端点**,
+                     实测怀疑会干扰微信取音 -> 发出空语音条。
+                     不确定时设为 False 更保险;默认取 DIAG_RECORD。
+        rec_settle: 点录音按钮后、开始播放前等待的秒数。
+                    微信需要时间真正启动录音;太短会漏掉开头。
         keep_wav: 是否保留合成的 WAV
         verbose: 打印过程
 
@@ -395,16 +478,47 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
     # 1. 合成
     wav = os.path.join(out_dir, "_voice_send_%d.wav" % int(time.time()))
     log("[1/5] 合成语音 …")
+
+    # 先确认 TTS **真正就绪**再合成。
+    # 实测坑:api_v2.py 端口先通、模型后加载完;此时合成会失败,
+    # 表现就是"没有播放音频、没有点发送"(因为流程在第 1 步就退出了)。
+    if wait_tts_ready:
+        try:
+            if not tts.is_server_alive():
+                log("       TTS 未响应,等待启动(最多 %.0f 秒)…" % tts_wait)
+            ready, rinfo = tts.wait_until_ready(timeout=tts_wait, verbose=False)
+            if not ready:
+                res["error"] = ("TTS 服务未就绪:%s\n"
+                                "       请先启动 api_v2.py(控制面板 ⑥ 或 启动TTS服务.cmd),\n"
+                                "       等出现 'Uvicorn running on http://127.0.0.1:9880' 再操作。"
+                                % rinfo)
+                log("       ✗ " + res["error"].split("\n")[0])
+                return res
+        except Exception as e:
+            log("       (就绪检查跳过: %s)" % str(e)[:60])
+
     try:
         tts.synthesize(text, wav)
     except Exception as e:
         res["error"] = "合成失败: %s" % e
         log("   ", res["error"])
         return res
-    stereo, dur = load_for_cable(wav)
+    try:
+        stereo, dur, ainfo = load_for_cable(wav, verbose=verbose)
+    except SilentAudio as e:
+        res["error"] = "音频为空,已中止(不发空语音): %s" % e
+        log("       ✗", res["error"])
+        log("       排查:1) 参考音频是否正常  2) TTS 服务是否刚重启未加载完")
+        log("             3) 文本是否过短/全是符号")
+        return res
+    except Exception as e:
+        res["error"] = "音频处理失败: %s" % e
+        log("   ", res["error"])
+        return res
     res["wav"] = wav
     res["duration"] = dur
-    log("      时长 %.2fs" % dur)
+    res["audio"] = ainfo
+    log("      时长 %.2fs(已修剪开头 %.2fs)" % (dur, ainfo.get("trimmed_head", 0)))
 
     hwnd = find_window()
     if not hwnd:
@@ -423,10 +537,16 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         import session_guard
         g = session_guard.ensure_chat_open(
             hwnd, row_index, expect_name or "",
-            verbose=verbose, click_fn=ws.click)
+            verbose=verbose, click_fn=ws.click, strict=True)
         if not g.get("ok"):
-            res["error"] = "会话状态无法确认: %s" % g.get("note")
-            log("   ", res["error"])
+            res["error"] = ("会话状态无法确认,已中止发送(避免发错人): %s"
+                            % g.get("note"))
+            res["session"] = g
+            log("       ✗ " + res["error"])
+            log("       排查建议:")
+            log("         1) 把目标会话在微信里【置顶】,并重新核对 row 行号")
+            log("         2) 确认微信窗口是【最大化】的")
+            log("         3) 用 python voice_bot.py --list 查看当前真实行号")
             return res
         res["session"] = g
         log("       结果: %s(判定依据 %s)" % (g.get("action"), g.get("by")))
@@ -465,11 +585,22 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         return res
     log("       ✅ 已进入录音状态(绿色像素=%d)" % gcount)
 
+    # 3c. 再等一会儿,确保微信的录音管线真正开始取音
+    #     实测:点完按钮立刻播放,开头一段会被漏掉。
+    if rec_settle is None:
+        rec_settle = T_REC_SETTLE_AFTER
+    if rec_settle > 0:
+        log("       等待录音管线就绪 %.2fs" % rec_settle)
+        time.sleep(rec_settle)
+
     # 4. 播放(可选同步录音,便于诊断)
     log("[4/5] 播放到虚拟线缆 …")
     diag_path = None
-    if DIAG_RECORD and snapshot_prefix:
+    _diag = DIAG_RECORD if diag_record is None else bool(diag_record)
+    if _diag and snapshot_prefix:
         diag_path = "%s_cable.wav" % snapshot_prefix
+    elif not _diag:
+        log("       (已关闭诊断录音 —— 避免与微信抢录音设备)")
     try:
         info = play_to_cable(stereo, record_to=diag_path)
         if info:

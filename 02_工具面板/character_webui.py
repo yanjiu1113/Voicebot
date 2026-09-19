@@ -258,6 +258,60 @@ def api_save():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/status")
+def api_status():
+    """报告语音回复进程是否在运行 —— 改配置后需要重启才生效。"""
+    procs = []
+    try:
+        import psutil
+        for p in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+            try:
+                nm = (p.info["name"] or "").lower()
+                if "python" not in nm:
+                    continue
+                cl = " ".join(p.info["cmdline"] or [])
+                if "voice_bot" in cl:
+                    procs.append({
+                        "pid": p.info["pid"],
+                        "live": "--live" in cl,
+                        "since": p.info.get("create_time") or 0,
+                    })
+            except Exception:
+                continue
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:120]})
+    return jsonify({"ok": True, "running": procs, "need_restart": bool(procs)})
+
+
+@app.route("/api/stop", methods=["POST"])
+def api_stop():
+    """终止正在运行的语音回复进程(方便改完配置立刻重启)。"""
+    killed = []
+    try:
+        import psutil
+        me = os.getpid()
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                if p.info["pid"] == me:
+                    continue
+                nm = (p.info["name"] or "").lower()
+                if "python" not in nm:
+                    continue
+                cl = " ".join(p.info["cmdline"] or [])
+                if "voice_bot" in cl:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=5)
+                    except psutil.TimeoutExpired:
+                        p.kill()
+                    killed.append(p.info["pid"])
+            except Exception:
+                continue
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:150]})
+    return jsonify({"ok": True, "killed": killed})
+
+
 @app.route("/api/prompt/<path:name>")
 def api_prompt_get(name):
     c = read_prompt(name)
@@ -342,6 +396,12 @@ PAGE = r"""<!DOCTYPE html>
   .pill { display:inline-block; background:#e6edf5; color:#42586e; border-radius:10px;
           padding:2px 9px; font-size:11px; margin-left:6px; }
   .pill.off { background:#f5e6e6; color:#a33; }
+  #banner { background:#fff4e5; border:1px solid #f0c48a; color:#8a5a12;
+            border-radius:6px; padding:10px 14px; margin-bottom:14px;
+            font-size:13px; line-height:1.6; }
+  #banner button { background:#d99a3d; padding:5px 12px; font-size:12px;
+                   margin-left:8px; }
+  #banner b { color:#b93b36; }
 </style>
 </head>
 <body>
@@ -350,12 +410,15 @@ PAGE = r"""<!DOCTYPE html>
   <div id="list"></div>
   <div class="foot">
     <button class="wide g" onclick="addChar()">＋ 新增角色</button>
-    <div style="height:8px"></div>
+    <div style="height:6px"></div>
     <button class="wide" onclick="importFromWeChat()">从微信导入会话</button>
+    <div style="height:6px"></div>
+    <button class="wide s" onclick="delAllDisabled()">批量删除「不监视」</button>
   </div>
 </div>
 
 <div id="main">
+  <div id="banner" style="display:none"></div>
   <h2 id="title">请选择左侧角色</h2>
   <div class="sub" id="subtitle"></div>
   <div id="editor" style="display:none">
@@ -366,8 +429,12 @@ PAGE = r"""<!DOCTYPE html>
           <input type="text" id="f_name">
         </div>
         <div>
-          <label>会话 wxid(微信内部标识,不变)</label>
-          <input type="text" id="f_key">
+          <label>会话标识(填微信号 / 昵称 / wxid 都行)</label>
+          <input type="text" id="f_key" oninput="onKeyInput()">
+          <div class="hint" id="f_key_hint">
+            推荐填<b>微信号</b>(好友资料页可见)。也可填昵称或 wxid。<br>
+            程序会自动解析成微信内部 ID，填哪种都能工作。
+          </div>
         </div>
       </div>
       <div class="row">
@@ -378,12 +445,12 @@ PAGE = r"""<!DOCTYPE html>
             建议把对象在微信里置顶以固定。</div>
         </div>
         <div>
-          <label>启用</label>
+          <label>是否监视这个会话</label>
           <select id="f_enabled">
-            <option value="1">启用(会回复)</option>
-            <option value="0">停用(不回复)</option>
+            <option value="1">监视并回复</option>
+            <option value="0">不监视(完全忽略)</option>
           </select>
-          <div class="hint">停用的会话不写入 CHATS,不会自动回复。</div>
+          <div class="hint">选「不监视」则该会话<b>完全不读取、不回复</b>。</div>
         </div>
       </div>
       <label>关联 prompt 文件(可选,填了可一键载入)</label>
@@ -396,9 +463,19 @@ PAGE = r"""<!DOCTYPE html>
       <div class="hint">留空则用简短默认设定。想用长设定,可把 prompts 文件内容粘贴进来。</div>
       <div class="bar">
         <button class="g" onclick="saveChar()">保存</button>
-        <button class="s" onclick="delChar()">删除此角色</button>
         <button class="s" onclick="load()">放弃修改</button>
       </div>
+    </div>
+
+    <div class="card" style="border-color:#e8b6b3;background:#fff7f7">
+      <label style="color:#b93b36">危险操作</label>
+      <div class="hint" style="margin-bottom:8px">
+        删除后这个角色会立刻从 <code>voice_bot.py</code> 的 CHATS 中移除，
+        不再监视该会话。此操作可撤销：保存前的版本都在「05_文档\配置备份」里。
+      </div>
+      <button class="r" onclick="delChar()" style="font-size:14px;padding:10px 20px">
+        🗑 删除这个角色（停止监视该会话）
+      </button>
     </div>
 
     <div class="card">
@@ -430,6 +507,36 @@ async function load(){
   if(!r.ok){ toast('读取失败: '+(r.error||''), true); return; }
   STATE = r;
   render();
+  checkRunning();
+}
+
+async function checkRunning(){
+  const b = document.getElementById('banner');
+  try{
+    const s = await fetch('/api/status').then(x=>x.json());
+    if(s.ok && s.running && s.running.length){
+      const live = s.running.some(x=>x.live);
+      b.style.display = 'block';
+      b.innerHTML = '<b>⚠ 语音回复正在运行</b>（' +
+        s.running.map(x=>'PID '+x.pid+(x.live?' 实际发送':' 演练')).join('、') +
+        '）<br>你在这里的修改<b>不会立刻生效</b>，需要重启语音回复进程。' +
+        '<button onclick="stopBot()">立即停止它</button>' +
+        '<button onclick="checkRunning()" style="background:#8a8f98">刷新状态</button>';
+    } else {
+      b.style.display = 'none';
+    }
+  }catch(e){ b.style.display = 'none'; }
+}
+
+async function stopBot(){
+  if(!confirm('终止正在运行的语音回复进程？\n\n（改完配置后重新启动即可生效）')) return;
+  const r = await fetch('/api/stop', {method:'POST'}).then(x=>x.json());
+  if(r.ok){
+    toast('已终止 ' + (r.killed.length ? r.killed.join(', ') : '(没有进程)'));
+    checkRunning();
+  } else {
+    toast('终止失败: ' + (r.error||''), true);
+  }
 }
 
 function render(){
@@ -444,13 +551,30 @@ function render(){
     const c = STATE.chats[k];
     const d = document.createElement('div');
     d.className = 'item' + (k===CUR ? ' on' : '');
-    const off = (c.enabled === false) ? ' <span class="pill off">停用</span>' : '';
+    const off = (c.enabled === false)
+      ? ' <span class="pill off">不监视</span>'
+      : ' <span class="pill">监视中</span>';
     d.innerHTML = (c.name||'(未命名)') + off +
       '<small>' + k + ' · row ' + (c.row??0) + '</small>';
     d.onclick = ()=>{ CUR = k; renderEditor(); render(); };
     L.appendChild(d);
   });
   if(CUR && STATE.chats[CUR]) renderEditor();
+}
+
+function onKeyInput(){
+  const v = document.getElementById('f_key').value.trim();
+  const h = document.getElementById('f_key_hint');
+  if(!v){ h.innerHTML = '推荐填<b>微信号</b>。也可填昵称或 wxid。'; return; }
+  if(v.startsWith('wxid_')){
+    h.innerHTML = '⚠️ 这是 wxid（内部 ID）。能工作，但普通用户看不到，'+
+                  '建议改成<b>微信号</b>更直观。';
+  } else if(v === 'filehelper' || v === 'weixin'){
+    h.innerHTML = '这是<b>系统会话</b>（文件传输助手 / 微信团队），固定名称。';
+  } else {
+    h.innerHTML = '✓ 将按「' + v + '」解析成微信内部 ID。'+
+                  '注意：填昵称时，对方改名后会失效。';
+  }
 }
 
 function renderEditor(){
@@ -513,18 +637,34 @@ async function push(){
 
 function delChar(){
   if(!CUR) return;
-  if(!confirm('删除角色「'+(STATE.chats[CUR].name||CUR)+'」?')) return;
+  const nm = STATE.chats[CUR].name || CUR;
+  if(!confirm('确定删除角色「'+nm+'」？\n\n'+
+              '删除后 voice_bot.py 不再监视该会话。\n'+
+              '（旧版本已自动备份到 05_文档\\配置备份）')) return;
   delete STATE.chats[CUR];
   CUR = null;
   document.getElementById('editor').style.display='none';
+  document.getElementById('title').textContent = '请选择左侧角色';
+  document.getElementById('subtitle').textContent = '';
   push();
 }
 
 function addChar(){
-  const k = prompt('新会话的 wxid(或先随便填,稍后从微信导入):','wxid_');
+  const k = prompt('新会话的标识（填微信号 / 昵称 / wxid 都行）：','');
   if(!k) return;
-  STATE.chats[k] = { name:'新角色', row:0, persona:'', enabled:true };
-  CUR = k;
+  const key = k.trim();
+  const nm = prompt('显示名（必须与微信里显示的名字一致，发送前要用它核对标题）：','');
+  STATE.chats[key] = { name:(nm||key).trim(), row:0, persona:'', enabled:true };
+  CUR = key;
+  push();
+}
+
+async function delAllDisabled(){
+  const off = Object.keys(STATE.chats).filter(k=>STATE.chats[k].enabled===false);
+  if(!off.length){ toast('没有被设为「不监视」的角色'); return; }
+  if(!confirm('删除全部 '+off.length+' 个「不监视」的角色？\n\n'+off.join('\n'))) return;
+  off.forEach(k=>delete STATE.chats[k]);
+  if(off.includes(CUR)){ CUR = null; document.getElementById('editor').style.display='none'; }
   push();
 }
 
@@ -597,6 +737,24 @@ def index():
 
 
 def main():
+    # ⚠️ 关键:用 pythonw.exe 启动时没有 stdout/stderr,
+    #    直接 print() 会抛 OSError 导致进程静默退出。
+    #    所以这里先把标准输出重定向到日志文件。
+    try:
+        if sys.stdout is None or sys.stderr is None:
+            logp = os.path.join(ROOT, "05_文档", "webui.log")
+            os.makedirs(os.path.dirname(logp), exist_ok=True)
+            f = open(logp, "a", encoding="utf-8", buffering=1)
+            if sys.stdout is None:
+                sys.stdout = f
+            if sys.stderr is None:
+                sys.stderr = f
+        else:
+            # 有控制台时也做一层保护,避免编码问题
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     print("=" * 68)
     print("  VoiceBot 角色配置 Web UI")
     print("=" * 68)

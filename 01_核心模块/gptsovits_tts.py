@@ -61,11 +61,111 @@ DEFAULT_REF_AUDIO = os.environ.get(
 
 # 参考音频对应的文本（prompt_text）。
 # 说明：GPT-SoVITS 用「参考音频 + 它的文字内容」来克隆音色。
-# 留空也能出声，但音色相似度和稳定性会下降，建议填写。
-DEFAULT_PROMPT_TEXT = os.environ.get("GPT_SOVITS_PROMPT_TEXT", "")
+# 留空也能出声，但音色相似度和稳定性会明显下降（实测音色会"不对劲"），
+# 强烈建议填写 —— 内容就是那段参考音频里实际说的话。
+#
+# 优先顺序: 环境变量 > reference_config.json > 空
+def _load_reference_config():
+    """读取 VoiceBot/reference_config.json（由 02_工具面板/set_reference.py 维护）。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    p = os.path.join(root, "reference_config.json")
+    if not os.path.isfile(p):
+        return {}
+    try:
+        import json
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+_REF_CFG = _load_reference_config()
+
+
+def ensure_weights(gpt_path=None, sovits_path=None, timeout=180, verbose=True,
+                   force=False):
+    """确保 TTS 服务加载的是**指定的权重**,不依赖 tts_infer.yaml。
+
+    为什么需要:
+        实测 GPT-SoVITS 的 api_v2.py 会把 tts_infer.yaml 里的 `version`
+        **改写成 v1**(即使配置写的是 v2Pro)。若服务按那份被改写的配置
+        重启,就会加载到不匹配的版本 -> 音色异常。
+        所以这里在服务在线时主动调用接口把权重设成我们想要的,
+        绕开那个不可靠的字段。
+
+    ⚠️ 每次调用都会让服务**重新加载权重**(实测日志里会出现
+       "Loading Text2Semantic weights from ..."),既慢又占显存,
+       所以结果会缓存;同一对权重只设一次。要强制重设用 force=True。
+
+    返回 (ok, 信息文本)
+    """
+    import re
+    import requests
+
+    gpt_path = gpt_path or _REF_CFG.get("gpt_weights")
+    sovits_path = sovits_path or _REF_CFG.get("sovits_weights")
+
+    if not gpt_path or not sovits_path:
+        try:
+            yml = os.path.join(GPT_SOVITS_DIR, "GPT_SoVITS", "configs", "tts_infer.yaml")
+            with open(yml, "r", encoding="utf-8") as f:
+                txt = f.read()
+            m = re.search(r"t2s_weights_path:\s*(\S+)", txt)
+            if m and not gpt_path:
+                gpt_path = m.group(1)
+            m = re.search(r"vits_weights_path:\s*(\S+)", txt)
+            if m and not sovits_path:
+                sovits_path = m.group(1)
+        except Exception:
+            pass
+
+    if not gpt_path and not sovits_path:
+        return False, "没有可用的权重路径配置"
+
+    # 缓存:同一对权重不重复设置(避免反复重新加载)
+    cache_key = (gpt_path, sovits_path)
+    prev = getattr(ensure_weights, "_done", None)
+    if not force and prev == cache_key:
+        return True, "已设置过,跳过(%s)" % os.path.basename(gpt_path or "")
+
+    ok_all = True
+    msgs = []
+    for ep, p in (("/set_gpt_weights", gpt_path),
+                  ("/set_sovits_weights", sovits_path)):
+        if not p:
+            continue
+        p = p.replace("/", os.sep) if os.sep == "\\" else p
+        if not os.path.isfile(p):
+            ok_all = False
+            msgs.append("%s 文件不存在: %s" % (ep, os.path.basename(p)))
+            continue
+        try:
+            url = "http://%s:%s%s" % (GPT_SOVITS_HOST, GPT_SOVITS_PORT, ep)
+            r = requests.get(url, params={"weights_path": p}, timeout=timeout)
+            if r.status_code == 200:
+                msgs.append("%s -> %s" % (ep, os.path.basename(p)))
+            else:
+                ok_all = False
+                msgs.append("%s 失败: %s %s" % (ep, r.status_code, r.text[:60]))
+        except Exception as e:
+            ok_all = False
+            msgs.append("%s 异常: %s" % (ep, str(e)[:60]))
+
+    if ok_all:
+        ensure_weights._done = cache_key
+
+    if verbose:
+        for line in msgs:
+            print("  [TTS] %s" % line)
+    return ok_all, " | ".join(msgs)
+
+DEFAULT_PROMPT_TEXT = os.environ.get(
+    "GPT_SOVITS_PROMPT_TEXT", _REF_CFG.get("prompt_text", ""))
 
 # 参考音频语种：zh / en / ja / ko / yue
-DEFAULT_PROMPT_LANG = os.environ.get("GPT_SOVITS_PROMPT_LANG", "zh")
+DEFAULT_PROMPT_LANG = os.environ.get(
+    "GPT_SOVITS_PROMPT_LANG", _REF_CFG.get("prompt_lang", "zh"))
 # 合成文本语种
 DEFAULT_TEXT_LANG = os.environ.get("GPT_SOVITS_TEXT_LANG", "zh")
 
@@ -125,11 +225,22 @@ def clean_text_for_tts(text):
 
 
 def _resolve_ref_audio(ref_audio_path=None):
-    """把参考音频路径解析为绝对路径。"""
-    p = ref_audio_path or DEFAULT_REF_AUDIO
-    if not os.path.isabs(p):
-        p = os.path.join(GPT_SOVITS_DIR, p)
-    return p
+    """把参考音频路径解析为绝对路径。
+
+    优先顺序: 显式传入 > reference_config.json > DEFAULT_REF_AUDIO
+    """
+    p = ref_audio_path or _REF_CFG.get("ref_audio") or DEFAULT_REF_AUDIO
+    if not p:
+        return ""
+    p = p.replace("/", os.sep)
+    if os.path.isabs(p):
+        return p
+    # 相对路径:先试 VoiceBot 根目录,再试 GPT-SoVITS 目录
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cand = os.path.join(root, p)
+    if os.path.isfile(cand):
+        return cand
+    return os.path.join(GPT_SOVITS_DIR, p)
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +435,11 @@ def is_server_alive(host=None, port=None, timeout=3):
 
 
 def wait_for_server(host=None, port=None, timeout=180, interval=2, on_wait=None):
-    """等待 GPT-SoVITS 服务就绪。返回 True/False。"""
+    """等待 GPT-SoVITS 服务就绪。返回 True/False。
+
+    注意:这只保证**端口可响应**,不保证模型已加载完。
+    要确认真正可用请用 wait_until_ready()。
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if is_server_alive(host=host, port=port):
@@ -336,6 +451,55 @@ def wait_for_server(host=None, port=None, timeout=180, interval=2, on_wait=None)
                 pass
         time.sleep(interval)
     return False
+
+
+def wait_until_ready(timeout=180, verbose=True, interval=3.0):
+    """等待 TTS **真正可用**(端口通了 + 模型加载完 + 能合成)。
+
+    为什么需要:
+        api_v2.py 启动后端口很快就能响应,但**模型还在加载**。
+        此时调 /tts 会失败。实测踩过这个坑:
+        没等启动完就发送 -> "合成失败" -> 没有播放音频、没有点发送。
+
+    返回 (ok, 信息文本)
+    """
+    t0 = time.time()
+    last = "未开始"
+    while time.time() - t0 < timeout:
+        if is_server_alive():
+            # 端口通了:再确认模型真能合成(用极短文本探一次)
+            ok, info = _probe_synthesis()
+            if ok:
+                # 顺带把权重设成配置的那对
+                try:
+                    ensure_weights(verbose=False)
+                except Exception:
+                    pass
+                if verbose:
+                    print("  [TTS] 已就绪(等待 %.0f 秒)" % (time.time() - t0))
+                return True, "ready in %.0fs" % (time.time() - t0)
+            last = info
+        else:
+            last = "端口未响应"
+        time.sleep(interval)
+    return False, "等待超时(%.0f 秒),最后状态: %s" % (timeout, last)
+
+
+def _probe_synthesis(timeout=60):
+    """试合成一小段,确认模型确实加载完。返回 (ok, 信息)。"""
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), "_tts_probe.wav")
+    try:
+        synthesize("测试", tmp, timeout=timeout)
+        ok = os.path.isfile(tmp) and os.path.getsize(tmp) > 1000
+        return ok, ("ok" if ok else "输出文件异常")
+    except Exception as e:
+        return False, str(e)[:70]
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
 
 
 def set_weights(gpt_path=None, sovits_path=None, host=None, port=None, timeout=60):

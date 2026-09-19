@@ -37,32 +37,76 @@ BACKUP_DIR = os.path.join(ROOT, "05_文档", "配置备份")
 
 TTS_API = "http://127.0.0.1:9880"
 
-# 常用模型(实测可用)
+# 默认候选模型(选了"自定义/未知服务商"时用)
 AI_MODELS = [
-    "deepseek/deepseek-v4-flash",
-    "deepseek/deepseek-v3.2",
-    "deepseek/deepseek-v4-pro",
-    "deepseek/deepseek-chat-v3.1",
-    "deepseek/deepseek-r1-0528",
+    "deepseek-v4-pro",
+    "deepseek-flash",
+    "deepseek-chat",
+    "deepseek-reasoner",
 ]
 
-# 常见服务商(选了会自动填 BASE_URL)
+# 常见服务商(选了会自动填 BASE_URL 与该服务商的**正确模型名格式**)
+#
+# ⚠️ 各家的模型名规则不同,混用会报 "The supported API model names are ..."
+#     OpenRouter   ->  deepseek/deepseek-v4-pro     (带 vendor 前缀)
+#     DeepSeek官方  ->  deepseek-v4-pro              (不带前缀)
+#     硅基流动      ->  deepseek-ai/DeepSeek-V3
 PROVIDERS = [
     ("OpenRouter", "https://openrouter.ai/api/v1",
      ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v3.2",
-      "deepseek/deepseek-v4-pro", "deepseek/deepseek-chat-v3.1"]),
+      "deepseek/deepseek-v4-pro", "deepseek/deepseek-chat-v3.1",
+      "deepseek/deepseek-r1-0528"]),
     ("DeepSeek 官方", "https://api.deepseek.com",
-     ["deepseek-chat", "deepseek-reasoner"]),
+     ["deepseek-v4-pro", "deepseek-flash", "deepseek-chat",
+      "deepseek-reasoner"]),
     ("硅基流动", "https://api.siliconflow.cn/v1",
      ["deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1"]),
     ("月之暗面 Moonshot", "https://api.moonshot.cn/v1",
-     ["moonshot-v1-8k", "moonshot-v1-32k"]),
+     ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"]),
     ("阿里百炼", "https://dashscope.aliyuncs.com/compatible-mode/v1",
-     ["qwen-plus", "qwen-max"]),
+     ["qwen-plus", "qwen-max", "qwen-turbo"]),
     ("智谱 GLM", "https://open.bigmodel.cn/api/paas/v4",
-     ["glm-4-plus", "glm-4-flash"]),
-    ("自定义", "", []),
+     ["glm-4-plus", "glm-4-flash", "glm-4-air"]),
+    ("自定义 / 第三方中转", "", []),
 ]
+
+
+def validate_model_for_provider(base_url, model):
+    """检查模型名与 BASE_URL 是否匹配。返回 (是否可疑, 提示文本)。
+
+    这是踩过的坑:把 OpenRouter 的 'deepseek/xxx' 用在实际是
+    api.deepseek.com 的端点上,导致所有模型都失败。
+    """
+    b = (base_url or "").lower()
+    m = (model or "").strip()
+    if not b or not m:
+        return False, ""
+
+    has_slash = "/" in m
+
+    # OpenRouter 需要带 vendor 前缀
+    if "openrouter.ai" in b:
+        if not has_slash:
+            return True, ("OpenRouter 的模型名通常需要带厂商前缀,例如 "
+                          "'deepseek/deepseek-v4-pro'。你填的 %r 可能不被接受。" % m)
+        return False, ""
+
+    # DeepSeek 官方不需要前缀
+    if "api.deepseek.com" in b:
+        if has_slash:
+            return True, ("DeepSeek 官方 API 的模型名**不带**厂商前缀,例如 "
+                          "'deepseek-v4-pro'。你填的 %r 会报 "
+                          "\"The supported API model names are...\"。" % m)
+        return False, ""
+
+    # 硅基流动需要 'vendor/Model' 形式
+    if "siliconflow" in b:
+        if not has_slash:
+            return True, ("硅基流动的模型名形如 'deepseek-ai/DeepSeek-V3',"
+                          "你填的 %r 可能不被接受。" % m)
+        return False, ""
+
+    return False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -108,14 +152,64 @@ def scan_weights():
     return gpt, sov
 
 
+AUDIO_EXT = (".wav", ".mp3", ".flac", ".m4a", ".ogg")
+REF_DIR = os.path.join(ROOT, "参考音频")
+REF_CONFIG = os.path.join(ROOT, "reference_config.json")
+
+
 def scan_ref_audio():
+    """扫描可用参考音频:优先 VoiceBot/参考音频/,其次 GPT-SoVITS/参考音频/。
+    返回 [(文件名, 绝对路径, 时长秒或 None), ...]"""
     out = []
-    d = os.path.join(TTS_DIR, "参考音频")
-    if os.path.isdir(d):
+    seen = set()
+    for d in (REF_DIR, os.path.join(TTS_DIR, "参考音频")):
+        if not os.path.isdir(d):
+            continue
         for f in sorted(os.listdir(d)):
-            if f.lower().endswith((".wav", ".mp3", ".flac")):
-                out.append(f)
+            if not f.lower().endswith(AUDIO_EXT) or f in seen:
+                continue
+            seen.add(f)
+            p = os.path.join(d, f)
+            out.append((f, p, _wav_duration(p)))
     return out
+
+
+def _wav_duration(path):
+    """读 wav 时长(秒);非 wav 或失败返回 None。"""
+    try:
+        import wave
+        with wave.open(path, "rb") as w:
+            return w.getnframes() / float(w.getframerate())
+    except Exception:
+        return None
+
+
+def read_ref_config():
+    """读 reference_config.json。"""
+    if not os.path.isfile(REF_CONFIG):
+        return {}
+    try:
+        with open(REF_CONFIG, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_ref_config(audio_path, prompt_text, lang="zh"):
+    """写 reference_config.json(存相对 VoiceBot 根目录的路径,便于移植)。"""
+    stored = audio_path
+    if audio_path and os.path.isabs(audio_path):
+        try:
+            rel = os.path.relpath(audio_path, ROOT)
+            if not rel.startswith(".."):
+                stored = rel.replace("\\", "/")
+        except Exception:
+            pass
+    cfg = {"ref_audio": stored, "prompt_text": prompt_text or "",
+           "prompt_lang": lang or "zh"}
+    with open(REF_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    return cfg
 
 
 def read_yaml_custom():
@@ -436,13 +530,41 @@ class ConfigTool:
         tk.Label(r3, text="(与权重的训练版本一致,通常 v2Pro)", bg="#f4f6f8",
                  fg="#7a8899", font=("Microsoft YaHei", 8)).pack(side="left")
 
-        # 参考音频
-        r4 = tk.Frame(f, bg="#f4f6f8"); r4.pack(fill="x", padx=14, pady=(10, 4))
+        # ---- 参考音频(决定音色,极重要) ----
+        sep = tk.Frame(f, bg="#dfe5ec", height=1)
+        sep.pack(fill="x", padx=14, pady=(14, 0))
+        tk.Label(f, text="参考音频(决定音色)", bg="#f4f6f8",
+                 font=("Microsoft YaHei", 12, "bold")).pack(anchor="w", padx=14, pady=(10, 2))
+        tk.Label(f, text="GPT-SoVITS 靠「参考音频 + 该音频的文字」克隆音色;\n"
+                         "文字留空或与音频不对应,音色都会明显失真。",
+                 bg="#f4f6f8", fg="#7a8899", justify="left",
+                 font=("Microsoft YaHei", 8)).pack(anchor="w", padx=14)
+
+        r4 = tk.Frame(f, bg="#f4f6f8"); r4.pack(fill="x", padx=14, pady=(10, 2))
         tk.Label(r4, text="参考音频 :", bg="#f4f6f8", width=10, anchor="w",
                  font=("Microsoft YaHei", 10)).pack(side="left")
         self.ref_var = tk.StringVar()
-        self.ref_combo = ttk.Combobox(r4, textvariable=self.ref_var, width=40)
+        self.ref_combo = ttk.Combobox(r4, textvariable=self.ref_var, width=48,
+                                      state="readonly")
         self.ref_combo.pack(side="left", padx=6)
+        self.ref_combo.bind("<<ComboboxSelected>>", self._on_ref_selected)
+        tk.Button(r4, text="打开目录", command=self._open_ref_dir,
+                  bg="#8a8f98", fg="white", relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei", 8)).pack(side="left", padx=4)
+
+        self.ref_info = tk.Label(f, text="", bg="#f4f6f8", fg="#4a90d9",
+                                 font=("Microsoft YaHei", 9))
+        self.ref_info.pack(anchor="w", padx=14, pady=(4, 2))
+
+        r5 = tk.Frame(f, bg="#f4f6f8"); r5.pack(fill="x", padx=14, pady=(4, 4))
+        tk.Label(r5, text="对应文字 :", bg="#f4f6f8", width=10, anchor="w",
+                 font=("Microsoft YaHei", 10)).pack(side="left", anchor="n")
+        self.ref_text = tk.Text(r5, height=3, width=58, font=("Microsoft YaHei", 9),
+                                wrap="word", relief="solid", borderwidth=1)
+        self.ref_text.pack(side="left", padx=6)
+        tk.Button(r5, text="用文件名\n自动填入", command=self._ref_text_from_name,
+                  bg="#4a90d9", fg="white", relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei", 8)).pack(side="left", padx=4)
 
         self.tts_status = tk.Label(f, text="", bg="#f4f6f8", font=("Microsoft YaHei", 9))
         self.tts_status.pack(anchor="w", padx=14, pady=(8, 2))
@@ -457,6 +579,75 @@ class ConfigTool:
         tk.Button(br, text="试听一句", command=self.test_tts,
                   bg="#8a6fd9", fg="white", relief="flat", cursor="hand2",
                   font=("Microsoft YaHei", 10), height=2, width=12).pack(side="left", padx=6)
+
+    # ---- 参考音频相关回调 ----
+    def _ref_list(self):
+        """返回 [(显示名, 绝对路径)]"""
+        out = []
+        for name, path, dur in scan_ref_audio():
+            tag = ""
+            if dur is None:
+                tag = "  [时长?]"
+            elif dur < 3.0 or dur > 10.0:
+                tag = "  [⚠ %.1fs 超出3~10s]" % dur
+            else:
+                tag = "  [%.1fs ✓]" % dur
+            out.append((name + tag, path, name, dur))
+        return out
+
+    def _open_ref_dir(self):
+        try:
+            os.makedirs(REF_DIR, exist_ok=True)
+            os.startfile(REF_DIR)
+            self._log("[参考音频] 已打开目录: %s" % REF_DIR)
+            self._log("           把音频丢进去,文件名写成它说的话,然后点「刷新列表」")
+        except Exception as e:
+            self._log("[参考音频] 打开目录失败: %s" % e)
+
+    def _on_ref_selected(self, evt=None):
+        """选中参考音频后:显示时长,并尝试从文件名填入文字。"""
+        sel = self.ref_var.get()
+        path = self._ref_path_by_label(sel)
+        if not path:
+            return
+        dur = _wav_duration(path)
+        name = os.path.basename(path)
+        if dur is None:
+            self.ref_info.config(text="时长: 非 wav 或无头信息(需自行确认在 3~10 秒内)",
+                                 fg="#d99a3d")
+        elif dur < 3.0 or dur > 10.0:
+            self.ref_info.config(
+                text="⚠ 时长 %.2f 秒 —— 超出 3~10 秒范围,合成会直接失败!" % dur,
+                fg="#d9534f")
+        else:
+            self.ref_info.config(text="✓ 时长 %.2f 秒(符合 3~10 秒)" % dur, fg="#2fa36b")
+
+        # 若文字框为空,自动用文件名填
+        cur = self.ref_text.get("1.0", "end").strip()
+        if not cur:
+            self.ref_text.delete("1.0", "end")
+            self.ref_text.insert("1.0", os.path.splitext(name)[0])
+
+    def _ref_path_by_label(self, label):
+        for disp, path, name, dur in self._ref_list():
+            if disp == label:
+                return path
+        # 兼容:label 可能是纯文件名
+        for disp, path, name, dur in self._ref_list():
+            if name == label:
+                return path
+        return None
+
+    def _ref_text_from_name(self):
+        label = self.ref_var.get()
+        path = self._ref_path_by_label(label)
+        if not path:
+            self._log("[参考音频] 请先选择一个参考音频")
+            return
+        name = os.path.splitext(os.path.basename(path))[0]
+        self.ref_text.delete("1.0", "end")
+        self.ref_text.insert("1.0", name)
+        self._log("[参考音频] 已用文件名填入文字(%d 字)" % len(name))
 
     # ---------------- 留存 ----------------
     def _build_retention_tab(self, nb):
@@ -576,6 +767,15 @@ class ConfigTool:
             if not messagebox.askyesno("Key 为空", "API Key 为空,确定继续?(大多数服务商会拒绝)"):
                 return
 
+        # 模型名与服务商是否匹配(踩过的坑:OpenRouter 风格用到 DeepSeek 官方)
+        sus, msg = validate_model_for_provider(base, model)
+        if sus:
+            if not messagebox.askyesno(
+                    "模型名可能不匹配",
+                    "%s\n\n仍然保存吗?\n\n(如果保存后报「所有模型均不可用」,\n"
+                    " 就是这个原因)" % msg):
+                return
+
         b = backup(WCB_CONFIG, "before_ai")
         try:
             n = write_wcb_config({
@@ -609,6 +809,24 @@ class ConfigTool:
                 from openai import OpenAI
                 self.root.after(0, self._log, "[测试] 连接 %s  模型 %s …" % (base, model))
                 c = OpenAI(api_key=key or "dummy", base_url=base)
+
+                # 1) 先列服务商真实支持的模型(避免猜名字)
+                try:
+                    ids = [x.id for x in c.models.list().data]
+                    if ids:
+                        self.root.after(0, self._log,
+                                        "[测试] 该服务商支持 %d 个模型:" % len(ids))
+                        for i in range(0, min(len(ids), 30), 3):
+                            self.root.after(0, self._log,
+                                            "        " + "  ".join(ids[i:i + 3]))
+                        if model not in ids:
+                            self.root.after(0, self._log,
+                                            "[测试] ⚠ 你填的 %r 不在上面列表里!" % model)
+                except Exception as e:
+                    self.root.after(0, self._log,
+                                    "[测试] (无法列出模型: %s)" % str(e)[:70])
+
+                # 2) 试调
                 t0 = time.time()
                 r = c.chat.completions.create(
                     model=model,
@@ -621,13 +839,20 @@ class ConfigTool:
                     self.root.after(0, self._log,
                                     "[测试] ⚠ 返回空内容 —— 若为推理模型,增大 MAX_TOKEN 试试")
             except Exception as e:
-                self.root.after(0, self._log, "[测试] ✗ 失败: %s" % str(e)[:200])
+                self.root.after(0, self._log, "[测试] ✗ 失败: %s" % str(e)[:260])
+                sus, msg = validate_model_for_provider(base, model)
+                if sus:
+                    self.root.after(0, self._log, "[测试] 原因可能是: %s" % msg)
         threading.Thread(target=work, daemon=True).start()
+
     def load_tts(self):
         gpt, sov = scan_weights()
         self.gpt_combo["values"] = ["%s/%s" % (d, f) for d, f in gpt]
         self.sov_combo["values"] = ["%s/%s" % (d, f) for d, f in sov]
-        self.ref_combo["values"] = scan_ref_audio()
+
+        # 参考音频下拉:带时长与合规提示
+        refs = self._ref_list()
+        self.ref_combo["values"] = [r[0] for r in refs]
 
         cur = read_yaml_custom()
         t2s = cur.get("t2s_weights_path", "")
@@ -642,17 +867,34 @@ class ConfigTool:
         self.gpt_var.set(short(t2s))
         self.sov_var.set(short(vits))
         self.ver_var.set(cur.get("version", "v2Pro"))
-        if not self.ref_var.get():
-            r = scan_ref_audio()
-            if r:
-                self.ref_var.set(r[0])
+
+        # 从 reference_config.json 载入当前参考音频与文字
+        rc = read_ref_config()
+        cur_ref = (rc.get("ref_audio") or "").replace("/", os.sep)
+        cur_name = os.path.basename(cur_ref) if cur_ref else ""
+        matched = False
+        for disp, path, name, dur in refs:
+            if name == cur_name:
+                self.ref_var.set(disp)
+                matched = True
+                break
+        if not matched and refs:
+            # 配置里的文件不存在了,退回第一个并提示
+            self.ref_var.set(refs[0][0])
+            if cur_name:
+                self._log("[参考音频] ⚠ 配置里的 %s 已不存在,请重新选择" % cur_name)
+        # 文字
+        self.ref_text.delete("1.0", "end")
+        self.ref_text.insert("1.0", rc.get("prompt_text", ""))
+        if self.ref_var.get():
+            self._on_ref_selected()
 
         online = tts_online()
         self.tts_status.config(
             text="TTS 服务: %s" % ("在线(可热切换)" if online else "离线(仅写配置文件,重启后生效)"),
             fg="#2fa36b" if online else "#d9534f")
-        self._log("[TTS] 扫描到 GPT 权重 %d 个, SoVITS 权重 %d 个, 服务%s" % (
-            len(gpt), len(sov), "在线" if online else "离线"))
+        self._log("[TTS] 扫描到 GPT 权重 %d 个, SoVITS 权重 %d 个, 参考音频 %d 个, 服务%s" % (
+            len(gpt), len(sov), len(refs), "在线" if online else "离线"))
 
     def load_retention(self):
         try:
@@ -691,6 +933,28 @@ class ConfigTool:
                 messagebox.showerror("找不到文件", p)
                 return
 
+        # ---- 参考音频校验(踩过的坑:时长超范围会直接失败) ----
+        ref_path = self._ref_path_by_label(self.ref_var.get())
+        ref_text = self.ref_text.get("1.0", "end").strip()
+        if ref_path:
+            dur = _wav_duration(ref_path)
+            if dur is not None and (dur < 3.0 or dur > 10.0):
+                messagebox.showerror(
+                    "参考音频时长不合规",
+                    "当前参考音频时长 %.2f 秒,超出 GPT-SoVITS 要求的 3~10 秒。\n\n"
+                    "继续保存会导致每次合成都报:\n"
+                    "  「参考音频在3~10秒范围外，请更换！」\n\n"
+                    "请换一个 3~10 秒的片段。" % dur)
+                return
+            if not ref_text:
+                if not messagebox.askyesno(
+                        "缺少对应文字",
+                        "参考音频的「对应文字」为空。\n\n"
+                        "GPT-SoVITS 靠「音频 + 文字」克隆音色,文字留空会让音色\n"
+                        "明显失真(这是实测踩过的坑)。\n\n"
+                        "仍要保存吗?"):
+                    return
+
         b = backup(TTS_YAML, "before_tts")
         try:
             write_yaml_custom(
@@ -703,6 +967,15 @@ class ConfigTool:
         self._log("[TTS] 已写入 tts_infer.yaml")
         if b:
             self._log("     备份: %s" % os.path.basename(b))
+
+        # ---- 保存参考音频配置 ----
+        if ref_path:
+            try:
+                cfg = write_ref_config(ref_path, ref_text)
+                self._log("[TTS] 参考音频已保存: %s" % cfg["ref_audio"])
+                self._log("     对应文字: %s" % (ref_text[:50] or "(空)"))
+            except Exception as e:
+                self._log("[TTS] ⚠ 参考音频配置写入失败: %s" % e)
 
         if tts_online():
             self._log("[TTS] 服务在线,尝试热切换 …")
