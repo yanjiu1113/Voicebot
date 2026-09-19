@@ -119,7 +119,12 @@ _ocr_tmp = None
 
 
 def _ocr_image(img, tag="t"):
-    """对 PIL Image 做 OCR,返回识别文本(失败返回 '')。"""
+    """对 PIL Image 做 OCR,返回识别文本(失败返回 '')。
+
+    ⚠️ 实测坑:用 OcrEngine.try_create_from_user_profile_languages()
+       时,本机读不出中文会话名(标题区明明有文字却返回空)。
+       改成**明确指定 zh-CN** 后正常。所以这里按语言显式创建。
+    """
     global _ocr_tmp
     import asyncio
     tmp_dir = os.path.join(_HERE, "voice_bot_shots")
@@ -129,13 +134,27 @@ def _ocr_image(img, tag="t"):
 
     async def _run():
         from winsdk.windows.media.ocr import OcrEngine
+        from winsdk.windows.globalization import Language
         from winsdk.windows.graphics.imaging import BitmapDecoder
         from winsdk.windows.storage import StorageFile, FileAccessMode
         f = await StorageFile.get_file_from_path_async(path)
         st = await f.open_async(FileAccessMode.READ)
         dec = await BitmapDecoder.create_async(st)
         bmp = await dec.get_software_bitmap_async()
-        eng = OcrEngine.try_create_from_user_profile_languages()
+
+        # 优先中文,退回英文,最后才是系统语言
+        eng = None
+        for tag_lang in ("zh-CN", "zh-Hans-CN", "en-US"):
+            try:
+                lang = Language(tag_lang)
+                if OcrEngine.is_language_supported(lang):
+                    eng = OcrEngine.try_create_from_language(lang)
+                    if eng is not None:
+                        break
+            except Exception:
+                continue
+        if eng is None:
+            eng = OcrEngine.try_create_from_user_profile_languages()
         if eng is None:
             return ""
         res = await eng.recognize_async(bmp)
@@ -158,16 +177,43 @@ def _norm(s):
 
 
 def read_chat_title(hwnd, debug=False):
-    """读当前聊天窗口标题(会话名)。返回 (文本, 归一化文本)。"""
+    """读当前聊天窗口标题(会话名)。返回 (文本, 归一化文本)。
+
+    实测:单一裁剪框 + 单一放大会偶发读不出(同一会话上一次读得出、
+    下一次读不出)。所以这里**多区域 × 多放大倍数**依次尝试,
+    命中非空即返回,显著提高成功率。
+    """
     img, _ = _grab(hwnd)
     w, h = img.size
-    box = _scale_box(TITLE_BOX, w, h)
-    crop = img.crop(box)
-    crop = crop.resize((crop.width * 4, crop.height * 4), 1)
-    txt = _ocr_image(crop, "title")
+
+    # 候选裁剪框(窗口内像素):常规框 + 略大/略小/右移
+    boxes = [
+        TITLE_BOX,
+        (TITLE_BOX[0] - 20, TITLE_BOX[1] - 10, TITLE_BOX[2] + 40, TITLE_BOX[3] + 10),
+        (TITLE_BOX[0] + 10, TITLE_BOX[1], TITLE_BOX[2] - 60, TITLE_BOX[3]),
+        (TITLE_BOX[0], TITLE_BOX[1] - 6, TITLE_BOX[2] + 10, TITLE_BOX[3] + 6),
+    ]
+    scales = (4, 3, 5)
+
+    last = ""
+    for bi, box in enumerate(boxes):
+        sb = _scale_box(box, w, h)
+        if sb[2] <= sb[0] or sb[3] <= sb[1]:
+            continue
+        base = img.crop(sb)
+        for sc in scales:
+            crop = base.resize((base.width * sc, base.height * sc), 1)
+            txt = _ocr_image(crop, "title%d_%dx" % (bi, sc))
+            t = _norm(txt)
+            if t:
+                if debug:
+                    print("  [OCR标题] 裁剪=%s 放大%d倍 原文=%r -> %r"
+                          % (sb, sc, txt, t))
+                return txt, t
+            last = txt
     if debug:
-        print("  [OCR标题] 裁剪=%s 原文=%r 归一化=%r" % (box, txt, _norm(txt)))
-    return txt, _norm(txt)
+        print("  [OCR标题] 所有区域/倍数均未读出(最后=%r)" % last)
+    return last, _norm(last)
 
 
 def screen_grab(hwnd):
@@ -446,17 +492,31 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
         if title:
             log("  [会话] 当前标题「%s」≠ 目标「%s」-> 需要切换" % (title, target))
         else:
-            # 有会话打开,但标题 OCR 读不出 —— 宁可不动(避免误关)
-            log("  [会话] 有会话打开但标题读不出 -> 用活动行辅助判断")
-            hl, frac = is_row_highlighted(hwnd, row, debug=verbose)
-            if hl:
-                log("  [会话] 第%d行是活动行(%.0f%%)-> 视为已打开,跳过" % (row, frac * 100))
+            # 有会话打开,但标题 OCR 读不出。
+            #
+            # ⚠️ 实测局限:某些会话名(浅色细体小字,如"会话B")
+            #    OCR 就是读不出来,换区域/放大/预处理都无效。
+            #    但此时 title_area_range 已经确认**确实有会话打开**,
+            #    所以不能因为读不出名字就中止(那会让功能不可用)。
+            #
+            # 采取:核对"配置的行号是否就是活动行" ——
+            #    活动行可以近似反映当前打开的会话(有约 1 行的偏差,
+            #    所以允许 row±1)。对上就跳过点击。
+            log("  [会话] 有会话打开但标题读不出 -> 用活动行核对")
+            hit = None
+            for rr in (row, row + 1, row - 1):
+                if rr < 0:
+                    continue
+                hl, frac = is_row_highlighted(hwnd, rr, debug=verbose)
+                if hl:
+                    hit = (rr, frac)
+                    break
+            if hit:
+                log("  [会话] 第%d行是活动行(%.0f%%)-> 视为目标会话,跳过点击"
+                    % (hit[0], hit[1] * 100))
                 res.update(ok=True, action="skip", by="highlight-open")
                 return res
-            log("  [会话] 第%d行非活动行 -> 需要切换,但无法确认目标,保守中止" % row)
-            res.update(ok=False, action="abort", by="none",
-                       note="标题读不出且行号非活动行,无法安全切换")
-            return res
+            log("  [会话] 活动行与配置行号不符 -> 需要切换")
     else:
         log("  [会话] 会话框是空白的 -> 必须点击打开")
 
@@ -496,10 +556,11 @@ def ensure_chat_open(hwnd, row, name, verbose=True, click_fn=None,
     #    所以这里**逐个试**若干行,用 OCR 标题确认到底哪一行是目标。
     #
     #    ⚠️ toggle 陷阱:点"已打开"的会话会把它**关掉**。
-    #       为彻底避免自伤,进入探测前先确认聊天区是**空白**的
-    #       (若已有会话打开,直接走 3b 按行号切换,不做逐行试探)。
-    if target and method in ("auto", "probe") and not open_now:
-        log("  [探测] 聊天区空白,逐行查找「%s」(最多 %d 行)…" % (name, probe_rows))
+    #       为彻底避免自伤,进入探测前先确认会话框是**空白**的
+    #       —— 用 title_area_range 的 blank 判断(可靠),
+    #       而不是用聊天区色数(空会话也会被判成"无内容")。
+    if target and method in ("auto", "probe") and blank:
+        log("  [探测] 会话框空白,逐行查找「%s」(最多 %d 行)…" % (name, probe_rows))
         found_row = None
         found_title = ""
         for r in range(probe_rows):

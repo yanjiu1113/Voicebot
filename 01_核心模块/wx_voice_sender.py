@@ -563,7 +563,15 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
     log("[3/5] 点击语音条按钮 -> 录音")
     vx, vy = anchor_pos(hwnd, "voice_btn")
     log("       坐标 (%d,%d)" % (vx, vy))
-    ws.click(vx, vy)
+    ok_click = ws.click(vx, vy)
+    if not ok_click:
+        log("       ⚠ 点击未确认送达,再试一次")
+        try:
+            ws.bring_to_front(hwnd)
+            time.sleep(0.3)
+        except Exception:
+            pass
+        ws.click(vx, vy)
     time.sleep(T_RECORD_SETTLE)
 
     # 3b. 确认真的进入录音态(避免后面点了"发送"却发不出去)
@@ -631,27 +639,50 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         _snap(hwnd, "%s_recording.png" % snapshot_prefix)
 
     # 5. 发送
+    #
+    # ⚠️ 实测坑:SendInput 可能**静默失败**(前台锁定被拒/焦点被抢),
+    #    表现就是"鼠标动了但没点下去"。这时如果不管,录音会一直持续到
+    #    微信的 60 秒上限 —— 所以必须:
+    #      ① 点击前确保微信在前台;
+    #      ② 检查 click() 的返回值;
+    #      ③ 点完确认真的退出了录音态,失败则重试(重试前先复位光标到发送键)。
     log("[5/5] 点击发送")
     sx, sy = anchor_pos(hwnd, "send_btn")
     log("       坐标 (%d,%d)" % (sx, sy))
-    ws.click(sx, sy)
-    time.sleep(T_AFTER_SEND)
 
-    # 5b. 确认已退出录音态(即发送生效)
-    left, g3 = is_recording(hwnd, verbose=verbose)
-    if left:
-        res["error"] = "点击发送后仍在录音(绿色像素=%d),可能发出超长语音" % g3
-        log("   ⚠ " + res["error"])
-        # 再点一次尝试停止
-        ws.click(sx, sy)
+    sent = False
+    for attempt in range(3):
+        # 每次都先把微信拉到前台,降低 SendInput 被丢弃的概率
+        try:
+            ws.bring_to_front(hwnd)
+            time.sleep(0.25)
+        except Exception:
+            pass
+
+        ok_click = ws.click(sx, sy)
+        if not ok_click:
+            log("       ⚠ 第%d次点击未确认送达" % (attempt + 1))
+
         time.sleep(T_AFTER_SEND)
-        left2, g4 = is_recording(hwnd, verbose=False)
-        if not left2:
-            log("       重试后已退出录音,发送应该已生效")
-            res["error"] = None
-        else:
-            res["ok"] = False
-            return res
+        left, g = is_recording(hwnd, verbose=verbose)
+        if not left:
+            log("       ✅ 已退出录音态,发送生效")
+            sent = True
+            break
+        log("       ⚠ 仍在录音(绿色像素=%d),第%d次重试" % (g, attempt + 2))
+
+    if not sent:
+        # 三次都没成功:尝试取消,避免留下一条 60 秒的超长录音
+        res["error"] = "点击发送失败(3 次),已尝试取消录音"
+        log("   ✗ " + res["error"])
+        try:
+            cx, cy = anchor_pos(hwnd, "cancel_btn")
+            ws.click(cx, cy)
+            time.sleep(0.6)
+        except Exception:
+            pass
+        res["ok"] = False
+        return res
 
     if snapshot_prefix:
         _snap(hwnd, "%s_sent.png" % snapshot_prefix)

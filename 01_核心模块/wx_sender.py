@@ -165,15 +165,41 @@ def _send(*inputs):
     return user32.SendInput(n, ctypes.byref(arr), ctypes.sizeof(INPUT))
 
 
-def click(x, y):
-    """在屏幕绝对坐标点击(移动 + 左键按下抬起)。"""
-    user32.SetCursorPos(int(x), int(y))
-    time.sleep(0.15)
-    down = INPUT(type=INPUT_MOUSE,
-                 u=INPUT_UNION(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, None)))
-    up = INPUT(type=INPUT_MOUSE,
-               u=INPUT_UNION(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, None)))
-    _send(down, up)
+def click(x, y, verify=True, settle=0.08):
+    """在屏幕绝对坐标点击(移动 + 左键按下抬起)。
+
+    ⚠️ SendInput 会**静默失败**(前台锁定被系统拒绝、焦点被别的进程抢走)。
+       实测表现就是用户看到的"鼠标动了但没点下去"。
+       所以这里:
+         · 设置光标后确认它真的到了目标位置;
+         · 检查 SendInput 的返回值(返回事件个数,失败为 0);
+         · 失败时重试一次,并**把结果返回**,由调用方决定是否中止。
+
+    返回 True/False 表示是否确认点击已送达。
+    """
+    x, y = int(x), int(y)
+    for attempt in range(2):
+        user32.SetCursorPos(x, y)
+        time.sleep(settle)
+        # 确认光标到位(SendInput 是把事件发到**光标所在位置**的)
+        pt = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        if abs(pt.x - x) > 3 or abs(pt.y - y) > 3:
+            time.sleep(0.1)
+            continue
+        down = INPUT(type=INPUT_MOUSE,
+                     u=INPUT_UNION(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, None)))
+        up = INPUT(type=INPUT_MOUSE,
+                   u=INPUT_UNION(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, None)))
+        n = _send(down, up)
+        if n and n >= 2:
+            if attempt:
+                print("  [点击] 第2次尝试成功 (%d,%d)" % (x, y))
+            return True
+        time.sleep(0.12)
+    if verify:
+        print("  [点击] ⚠ 点击 (%d,%d) 未能确认送达(SendInput 失败)" % (x, y))
+    return False
 
 
 def _key(vk, up=False):
