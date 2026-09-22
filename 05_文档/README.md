@@ -120,6 +120,7 @@ VoiceBot/
 │   ├── config_tool.py                配置面板(模型/音色/参考音频/留存)
 │   ├── set_reference.py              设置参考音频与 prompt_text
 │   ├── 采集按钮坐标.py               重新标定按钮坐标(换分辨率后用)
+│   ├── 发布前隐私审计.py              push 前跑一遍:扫当前树+全部历史+提交信息
 │   ├── 初始化配置.py                 首次运行引导(缺 voice_bot.py 时自动生成)
 │   └── 生成发布模板.py               发布前生成 voice_bot.example.py
 ├── 03_诊断测试/                  各种自检脚本

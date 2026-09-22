@@ -64,3 +64,6 @@ desktop.ini
 
 # 按钮坐标(每台机器/每个窗口尺寸可能不同)
 01_核心模块/voice_button_coords.json
+
+# 「发布前隐私审计」用的本地词表 —— 里面会写真实昵称/微信号,绝不能进仓库
+02_工具面板/.private_tokens.txt
