@@ -633,26 +633,46 @@ def run_once(db, state, live):
             voice_text = clean_for_voice(reply)
             if not voice_text:
                 print("  [跳过] 清理后为空")
+                # 清空也要推进,否则会永远卡在这一条上
+                state.setdefault(chat_key, {})["last_create_time"] = item["time"]
+                save_state(state)
                 continue
 
-            if live:
-                r = send_voice(chat_key, voice_text, cfg["row"], expect_name=name,
-                               debug=DEBUG_MODE)
-                if r.get("ok"):
-                    print("  ✅ 语音条已发送")
-                    _sent_counter["n"] += 1
-                    maybe_cleanup(_sent_counter["n"])
+            # ★★ 关键:水位推进放进 finally ★★
+            #
+            # 旧写法是"发送之后再推进水位"。实测踩过的坑:
+            #   发送流程里抛出**未预料的异常**(ctypes 句柄溢出),
+            #   异常一路冒到轮询层 -> 那句赋值**永远走不到** ->
+            #   水位不前进 -> 下一轮又读到同一条旧消息 ->
+            #   **一直用同一句旧对话回答**,表象则是"没点发送键"。
+            # 放进 finally 后:无论发送成功、返回失败、还是抛异常,
+            # 水位都必然推进 —— 这个死循环从结构上不可能再出现。
+            try:
+                if live:
+                    r = send_voice(chat_key, voice_text, cfg["row"],
+                                   expect_name=name, debug=DEBUG_MODE)
+                    if r.get("ok"):
+                        print("  ✅ 语音条已发送")
+                        _sent_counter["n"] += 1
+                        maybe_cleanup(_sent_counter["n"])
+                    else:
+                        print("  ❌ 发送失败 [卡在: %s] %s"
+                              % (r.get("step") or "?", r.get("error")))
+                        print("     排查:查看 05_文档\\发送截图\\ 里最新的 _fail_*.png")
+                        print("           以及 05_文档\\运行日志\\ 里当天的日志")
                 else:
-                    print("  ❌ 发送失败 [卡在: %s] %s"
-                          % (r.get("step") or "?", r.get("error")))
-                    print("     排查:查看 05_文档\\发送截图\\ 里最新的 _fail_*.png,") 
-                    print("           以及 05_文档\\运行日志\\ 里当天的日志")
-            else:
-                print("  [DRY-RUN] 将发送语音: %s" % voice_text)
-
-            # 推进水位(无论成功失败都推进,避免重复轰炸)
-            state.setdefault(chat_key, {})["last_create_time"] = item["time"]
-            save_state(state)
+                    print("  [DRY-RUN] 将发送语音: %s" % voice_text)
+            except Exception as e:
+                # 未预料的异常:记下来、打印 traceback,但不让整轮崩掉
+                import traceback
+                print("  ❌ 发送流程抛出未预料的异常: %s: %s" % (type(e).__name__, e))
+                for _ln in traceback.format_exc().rstrip().split("\n")[-5:]:
+                    print("       %s" % _ln)
+                print("     已跳过这条消息(水位照常推进,避免卡在同一条上)")
+            finally:
+                # 推进水位(无论成功失败都推进,避免重复轰炸)
+                state.setdefault(chat_key, {})["last_create_time"] = item["time"]
+                save_state(state)
             time.sleep(1.5)
 
     return acted
@@ -868,6 +888,13 @@ def main():
                 raise
             except Exception as e:
                 print("[轮询异常] %s: %s" % (type(e).__name__, e))
+                # ★ 打出完整 traceback —— 否则只知道异常类型,不知道哪一行,
+                #   排查起来只能靠猜(实测吃过这个亏)。
+                import traceback
+                for _ln in traceback.format_exc().rstrip().split("\n")[-6:]:
+                    print("    %s" % _ln)
+                # 这一轮中断了,水位不会推进;提示一下免得以为它在正常工作
+                print("    (本轮中止:水位未推进,该会话下轮会重来)")
             if args.once:
                 break
             time.sleep(POLL_INTERVAL)

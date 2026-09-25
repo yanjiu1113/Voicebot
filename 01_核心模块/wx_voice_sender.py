@@ -612,6 +612,18 @@ def play_to_cable(stereo, record_to=None, stream=None):
 # 主流程
 # ---------------------------------------------------------------------------
 
+def _safe_cancel_recording(hwnd, ws, log=None):
+    """尽最大努力把微信里正在进行的录音取消掉(出错也不抛)。"""
+    try:
+        cx, cy = anchor_pos(hwnd, "cancel_btn")
+        ws.click(cx, cy, expect_hwnd=hwnd)
+        if log:
+            log("       (已尝试点取消键 %d,%d)" % (cx, cy))
+    except Exception as e:
+        if log:
+            log("       (取消录音失败,可手动点微信的 ✕: %s)" % str(e)[:50])
+
+
 def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
                       verbose=True, snapshot_prefix=None, expect_name=None,
                       wait_tts_ready=True, tts_wait=180,
@@ -905,7 +917,20 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
     #
     # ⚠️ 不能用单次采样就判定失败 —— 绿色工具栏本身有 1~2 秒延迟,
     #    单次采样正是旧代码的误判来源。这里给它一段观察窗口。
-    still, g2, _w = wait_recording(hwnd, timeout=REC_VERIFY_WINDOW, verbose=verbose)
+    # ★ 这里必须包异常:历史上正是这一句(is_recording -> PrintWindow -> GDI)
+    #   因句柄参数溢出而抛异常,异常冒出去导致"整轮中止、发送键没点到",
+    #   而且微信会一直留在录音状态。现在出错就取消录音并作为本次失败返回。
+    try:
+        still, g2, _w = wait_recording(hwnd, timeout=REC_VERIFY_WINDOW,
+                                      verbose=verbose)
+    except Exception as e:
+        import traceback
+        res["error"] = "校验录音态时出错: %s: %s" % (type(e).__name__, e)
+        log("   ✗ " + res["error"])
+        for _ln in traceback.format_exc().rstrip().split("\n")[-4:]:
+            log("       %s" % _ln)
+        _safe_cancel_recording(hwnd, ws, log)
+        return res
 
     if not still:
         # 播放完了却没录上 —— 最可能是语音条按钮那一下被吞了。
@@ -925,8 +950,14 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         except Exception as e:
             log("       ⚠ 重播失败: %s" % str(e)[:60])
         time.sleep(T_TAIL if _dbg else T_TAIL_COMPACT)
-        still, g2, _w = wait_recording(hwnd, timeout=REC_VERIFY_WINDOW,
-                                       verbose=verbose)
+        try:
+            still, g2, _w = wait_recording(hwnd, timeout=REC_VERIFY_WINDOW,
+                                           verbose=verbose)
+        except Exception as e:
+            res["error"] = "重试后校验录音态出错: %s: %s" % (type(e).__name__, e)
+            log("   ✗ " + res["error"])
+            _safe_cancel_recording(hwnd, ws, log)
+            return res
         res["retried"] = True
 
     if not still:
