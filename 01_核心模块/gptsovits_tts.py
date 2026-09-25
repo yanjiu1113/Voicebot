@@ -33,7 +33,35 @@ GPT_SOVITS_PORT = int(os.environ.get("GPT_SOVITS_PORT", "9880"))
 # 优先顺序: 环境变量 > 自动探测
 # 自动探测: 本文件位于 Desktop/VoiceBot/01_核心模块/ ,
 #           故 GPT-SoVITS 目录在 ../../../ 下按名称查找。
+def _load_deploy_paths():
+    """加载同目录的 部署路径.py。
+
+    用**显式文件路径**导入,不走 sys.path —— 因为 WeChatBot 项目里也存在同名
+    旧副本,靠 import 名字有被覆盖的风险(实测踩过:改动不生效)。
+    """
+    import importlib.util
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "部署路径.py")
+    if not os.path.isfile(p):
+        return None
+    spec = importlib.util.spec_from_file_location("voicebot_deploy_paths", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
 def _detect_tts_dir():
+    # 统一走 部署路径.py:
+    #   环境变量 > 控制面板里选的(部署路径.json) > 自动探测 > 默认猜测
+    # 这样"在控制面板里手动指定路径"才能真正生效 ——
+    # 否则这里会一直用自动探测的旧结果,面板里的设置形同虚设。
+    try:
+        m = _load_deploy_paths()
+        if m is not None:
+            return m.tts_dir()
+    except Exception:
+        pass
+
+    # ---- 兜底:部署路径.py 缺失或被改名时的老逻辑 ----
     here = os.path.dirname(os.path.abspath(__file__))
     # 1) 同级 / 上级目录里找名字含 GPT-SoVITS 的
     for up in (here, os.path.dirname(here), os.path.dirname(os.path.dirname(here)),

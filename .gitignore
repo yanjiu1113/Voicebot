@@ -70,3 +70,6 @@ desktop.ini
 
 # 对话记忆(含聊天内容,绝不进仓库)
 voice_bot_memory.json
+
+# 本机部署路径(控制面板里选的 WeChatBot / GPT-SoVITS 位置)
+部署路径.json

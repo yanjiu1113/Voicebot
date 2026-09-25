@@ -47,11 +47,43 @@ import time
 CORE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(CORE)
 DESKTOP = os.path.dirname(ROOT)
-PROJECT = os.path.join(DESKTOP, "WeChatBot_WXAUTO_SE-3.28")
 
-if not os.path.isdir(PROJECT):
-    print("找不到 WeChatBot 项目目录:", PROJECT)
-    print("预期结构: 桌面/WeChatBot_WXAUTO_SE-3.28")
+# WeChatBot 项目目录 —— 真正读写微信的是它,VoiceBot 只是个插件。
+# 位置允许用户自己放,所以统一交给 部署路径.py 解析,优先级:
+#     环境变量 WECHATBOT_DIR  >  部署路径.json(控制面板里选的)  >  自动探测
+# 用**显式文件路径**导入,不走 sys.path:WeChatBot 项目里存在同名旧副本,
+# 靠名字 import 有被覆盖的风险。
+def _resolve_project():
+    try:
+        import importlib.util
+        p = os.path.join(CORE, "部署路径.py")
+        spec = importlib.util.spec_from_file_location("voicebot_deploy_paths", p)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m.wechatbot_dir(), m
+    except Exception as e:
+        print("[警告] 读取 部署路径.py 失败,按默认目录名查找:", e)
+        return (os.environ.get("WECHATBOT_DIR")
+                or os.path.join(DESKTOP, "WeChatBot_WXAUTO_SE-3.28")), None
+
+
+PROJECT, _DEPLOY = _resolve_project()
+
+if _DEPLOY is not None:
+    _proj_ok, _proj_why = _DEPLOY.check_wechatbot(PROJECT)
+else:
+    _proj_ok = os.path.isdir(PROJECT)
+    _proj_why = "" if _proj_ok else "目录不存在"
+
+if not _proj_ok:
+    print("找不到可用的 WeChatBot 项目目录: %s" % PROJECT)
+    if _proj_why:
+        print("原因: %s" % _proj_why)
+    print("")
+    print("VoiceBot 本身不带微信读写能力,需要 WeChatBot 本体。请:")
+    print("  1. 下载并解压 WeChatBot_WXAUTO_SE 到任意目录")
+    print("  2. 打开 VoiceBot 控制面板,在下方『部署路径』点『选择…』指定它")
+    print("     (也可以直接改 %s)" % os.path.join(ROOT, "部署路径.json"))
     sys.exit(1)
 
 # ⚠️ 路径优先级很重要:

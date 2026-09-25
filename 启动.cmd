@@ -101,10 +101,29 @@ echo       Uvicorn running on http://127.0.0.1:9880
 echo.
 echo   *** 这个窗口不要关闭,关掉服务就停了 ***
 echo.
-cd /d "%ROOT%..\GPT-SoVITS-v2pro-20250604-nvidia50"
+rem ---- 目录来自 部署路径.json,与控制面板同一个来源 ----
+set "TTSDIR="
+if not defined PY goto :ttsnorun
+"%PY%" -X utf8 "%CORE%\部署路径.py" --print tts > "%TEMP%\voicebot_tts_dir.txt" 2>nul
+set /p TTSDIR=<"%TEMP%\voicebot_tts_dir.txt"
+del "%TEMP%\voicebot_tts_dir.txt" >nul 2>nul
+:ttsnorun
+if not defined TTSDIR set "TTSDIR=%ROOT%..\GPT-SoVITS-v2pro-20250604-nvidia50"
+echo   目录: %TTSDIR%
+echo.
+cd /d "%TTSDIR%" 2>nul
 if not exist "api_v2.py" (
-  echo   [错误] 找不到 api_v2.py
-  echo   预期位置: %CD%
+  echo   [错误] 这个目录里找不到 api_v2.py
+  echo   当前设置: %TTSDIR%
+  echo   可能还没部署 GPT-SoVITS,或者 TTS 路径不正确。
+  echo   请用控制面板下方 部署路径 区的 选择... 指定正确目录。
+  echo   也可以直接编辑: %ROOT%部署路径.json
+  pause
+  goto MENU
+)
+if not exist "runtime\python.exe" (
+  echo   [错误] 找不到 runtime\python.exe,整合包不完整。
+  echo   当前设置: %TTSDIR%
   pause
   goto MENU
 )
