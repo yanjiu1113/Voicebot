@@ -29,6 +29,7 @@ import ctypes
 import json
 import os
 import sys
+import threading
 import time
 import wave
 from ctypes import wintypes
@@ -256,6 +257,94 @@ T_REC_SETTLE_AFTER = 0.7    # 确认进入录音态后,再等这么久才播放
 T_TAIL = 0.5                # 播完后留的尾巴(避免截断;太长会变成尾部静音)
 T_TAIL_COMPACT = 0.35       # 紧凑模式下的尾巴
 T_AFTER_SEND = 2.0
+
+# ---------------------------------------------------------------------------
+# ★ 兜底看门狗:到点无条件点一次发送键
+#
+# 为什么需要:
+#     微信的语音录音上限是 60 秒。如果因为任何原因(异常、卡住、点击被吞、
+#     判定出错……)我们没点成发送键,录音会一直走到 60 秒 —— 那条语音就废了。
+#     所以这里设一个**不依赖任何状态检测**的兜底:从开始录音算起,
+#     到 REC_WATCHDOG_AT 秒时,只要还没成功发送过,就无条件点一次发送键。
+#
+# 两个刻意的设计:
+#   · 与主流程的点击共用 _CLICK_LOCK 互斥 —— 保证两次点击不会撞在一起
+#     (也就是"与检测/点击的时间错开")。
+#   · 等待用 0.37 秒这种不整齐的间隔轮询,避免刚好和主流程的检测节奏同拍。
+#
+# 注:"无条件"指的是**不依赖录音状态检测**;仍然保留"坐标必须属于微信"
+#     这道校验 —— 否则可能点到别的程序上,那是更危险的事。
+# ---------------------------------------------------------------------------
+REC_LIMIT_S = 60.0          # 微信语音条时长上限
+REC_WATCHDOG_AT = 58.0      # 兜底点发送的时刻(略早于上限,确保录音仍然有效)
+
+_CLICK_LOCK = threading.Lock()      # 主流程点击 与 兜底点击 互斥
+_WD = {"stop": None, "thread": None}
+_WD_LOCK = threading.Lock()
+
+
+def defuse_send_watchdog(reason="", log=None):
+    """撤销兜底看门狗(成功发送 / 取消录音 / 开始新的发送时调用)。"""
+    with _WD_LOCK:
+        ev = _WD.get("stop")
+        _WD["stop"] = None
+        _WD["thread"] = None
+    if ev is not None:
+        ev.set()
+        if log:
+            log("       [兜底] 已撤销(%s)" % (reason or "结束"))
+        return True
+    return False
+
+
+def arm_send_watchdog(hwnd, sx, sy, t_start, log, res):
+    """武装兜底:到 t_start+REC_WATCHDOG_AT 秒时无条件点发送键。"""
+    defuse_send_watchdog("有新的发送开始", log)
+    stop = threading.Event()
+    # ⚠️ 必须自己取一次 sender:ws 是 send_voice_by_row 的**局部**变量,
+    #    模块级函数里引用不到 —— 否则看门狗一触发就 NameError。
+    _ws = _import_sender()
+
+    def _run():
+        # 不整齐的轮询间隔,避免与主流程检测同拍
+        while not stop.is_set():
+            left = (t_start + REC_WATCHDOG_AT) - time.time()
+            if left <= 0:
+                break
+            stop.wait(min(left, 0.37))
+        if stop.is_set():
+            return
+        elapsed = time.time() - t_start
+        log("")
+        log("   >>> [兜底] 距开始录音已 %.1fs(上限 %.0fs),无条件点击发送键 <<<"
+            % (elapsed, REC_LIMIT_S))
+        log("       (正常流程未成功发送;这与录音状态检测无关,是最后一道保险)")
+        with _CLICK_LOCK:                    # ★ 与主流程点击互斥,防按键冲突
+            try:
+                _ws.bring_to_front(hwnd)
+            except Exception:
+                pass
+            ok = _ws.click(sx, sy, expect_hwnd=hwnd)
+        log("       [兜底] 点击返回: %s" % ok)
+        res["watchdog_fired"] = True
+        time.sleep(1.2)
+        try:
+            left_rec, grew = is_recording(hwnd)
+            log("       [兜底] 之后录音态: %s (绿色像素=%d)"
+                % ("仍在录音" if left_rec else "已结束(发送成功)", grew))
+            if left_rec:
+                log("       [兜底] ⚠ 仍在录音 —— 请检查微信是否被遮挡/未最大化")
+        except Exception as e:
+            log("       [兜底] 复查录音态失败: %s" % str(e)[:60])
+
+    t = threading.Thread(target=_run, daemon=True, name="send-watchdog")
+    with _WD_LOCK:
+        _WD["stop"] = stop
+        _WD["thread"] = t
+    t.start()
+    log("       [兜底] 已武装:%.0fs 后若仍未成功发送,将无条件点发送键"
+        % REC_WATCHDOG_AT)
+
 
 # ---------------------------------------------------------------------------
 # 诊断开关
@@ -614,6 +703,11 @@ def play_to_cable(stereo, record_to=None, stream=None):
 
 def _safe_cancel_recording(hwnd, ws, log=None):
     """尽最大努力把微信里正在进行的录音取消掉(出错也不抛)。"""
+    # 既然要取消录音,兜底看门狗也必须撤销,否则它稍后还会去点发送
+    try:
+        defuse_send_watchdog("已取消录音", log)
+    except Exception:
+        pass
     try:
         cx, cy = anchor_pos(hwnd, "cancel_btn")
         ws.click(cx, cy, expect_hwnd=hwnd)
@@ -657,6 +751,10 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
     """
     ws = _import_sender()
     import gptsovits_tts as tts
+
+    # ★ 先撤销上一次遗留的兜底看门狗 —— 否则它可能在下一条语音录音期间
+    #   突然点一下发送键,把新录音提前发出去。
+    defuse_send_watchdog("新的发送开始", None)
 
     out_dir = out_dir or _HERE
     res = {"ok": False, "wav": None, "duration": None, "error": None,
@@ -830,6 +928,7 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         close_cable_stream(_pre_stream)
         return res
 
+    t_rec_start = time.time()          # ★ 兜底计时起点 = 开始录音这一刻
     ok_click = ws.click(vx, vy, expect_hwnd=hwnd)
     if not ok_click:
         log("       ⚠ 点击未确认送达,再试一次")
@@ -974,6 +1073,10 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
             pass
         return res
     log("       ✅ 已确认在录音态(绿色像素=%d)" % g2)
+
+    # ★ 已确认真的在录音 -> 武装兜底看门狗
+    _sx, _sy = anchor_pos(hwnd, "send_btn")
+    arm_send_watchdog(hwnd, _sx, _sy, t_rec_start, log, res)
     # 注意:这里**不再**截图。PrintWindow 要 0.3s 左右,而录音还在继续,
     #       这段等待会变成语音条**结尾的静音**。
 
@@ -1007,7 +1110,8 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
             time.sleep(0.3)
             continue
 
-        ok_click = ws.click(sx, sy, expect_hwnd=hwnd)
+        with _CLICK_LOCK:                # ★ 与兜底点击互斥,防按键冲突
+            ok_click = ws.click(sx, sy, expect_hwnd=hwnd)
         if not ok_click:
             log("       ⚠ 第%d次点击被阻止或未确认送达" % (attempt + 1))
 
@@ -1016,23 +1120,22 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
         if not left:
             log("       ✅ 已退出录音态,发送生效")
             sent = True
+            defuse_send_watchdog("已成功发送", log)
             break
         log("       ⚠ 仍在录音(绿色像素=%d),第%d次重试" % (g, attempt + 2))
 
     if not sent:
-        # 三次都没成功:尝试取消,避免留下一条 60 秒的超长录音
+        # 三次都没成功。★ 这里**不再取消录音**:保留录音,让兜底看门狗在
+        # REC_WATCHDOG_AT 秒时再无条件试一次 —— 宁可发出一条尾部带静音的
+        # 语音,也不要把这条回复整个丢掉。
+        # (若想改回"失败就取消",把下面三行注释掉、恢复点取消键即可)
         res["error"] = ("点击发送失败(3 次)—— 发送键没点中或点击没送到微信。"
-                        "常见原因:微信窗口没有保持在最前面/被别的窗口遮挡")
+                        "已保留录音,等 %.0fs 兜底再试一次" % REC_WATCHDOG_AT)
         log("   ✗ " + res["error"])
         if snapshot_prefix:
             _snap(hwnd, "%s_fail_send.png" % snapshot_prefix)
-        try:
-            cx, cy = anchor_pos(hwnd, "cancel_btn")
-            ws.click(cx, cy, expect_hwnd=hwnd)
-            time.sleep(0.6)
-        except Exception:
-            pass
         res["ok"] = False
+        res["step"] = res.get("step") or "5-点击发送"
         return res
 
     if snapshot_prefix:
