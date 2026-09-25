@@ -13,8 +13,12 @@
 | `WeChatBot_WXAUTO_SE-3.28\.gitignore` | 忽略 `config.py`、`vendor_py/`、`libs/`、运行数据 |
 | `VoiceBot\.gitignore` | 忽略 `vendor_py/`、音频、截图、运行日志、状态文件、`*.ckpt/*.pth` |
 | `VoiceBot\.gitignore` | 忽略 **`01_核心模块/voice_bot.py`**(含真实微信号/昵称) |
-| `WeChatBot_WXAUTO_SE-3.28\config.example.py` | 配置模板,**5 个真实 Key 已全部替换为 `YOUR_API_KEY_HERE`** |
+| `VoiceBot\.gitignore` | 忽略 **`部署路径.json`**(含本机用户名路径) |
+| `WeChatBot_WXAUTO_SE-3.28\config.example.py` | 配置模板,**5 个真实 Key 已全部清空为 `''`**(登录密码占位为 `YOUR_PASSWORD_HERE`) |
 | `VoiceBot\01_核心模块\voice_bot.example.py` | 角色配置模板(`CHATS` 全为占位) |
+
+> ⚠️ 注意 `config.example.py` 里 Key 的占位是**空字符串 `''`**,不是 `YOUR_API_KEY_HERE`。
+> 别去搜后者,搜不到。
 
 > 模板由 `02_工具面板\生成发布模板.py` 生成 —— 它会**自动扫描敏感串**,
 > 发现真实微信号/昵称/Key 就直接中止,不会写出模板。
@@ -28,18 +32,29 @@ git ls-files | Select-String "config.py$"
 # 2) 确认 voice_bot.py 没被跟踪(应当没有任何输出)
 git ls-files | Select-String "voice_bot\.py$|voice_bot_config"
 
-# 3) 扫已提交内容里有没有真实标识 / Key(应当没有任何输出)
+# 3) 扫已提交内容里有没有真实标识 / Key
+#    这条会命中**占位符** —— 也就是 wxid_ 后面接一串重复字符的那种,属于正常,当没看见。
+#    真正要停下的情况:wxid_ 后面接的是**随机字母数字**(不是重复字符),
+#    或者出现 sk- 后接一长串字符。
 git grep -n -E "wxid_[a-z0-9]{10,}|sk-[A-Za-z0-9]{20,}"
 git grep -n -E "DEEPSEEK_API_KEY *=" 
 
 # 4) 直接扫**远程分支**的整棵树(最可靠,能发现历史里遗留的文件)
 git grep -n -I -E "sk-[A-Za-z0-9]{20,}" origin/main
 
-# 5) 确认仓库体积合理(应当 < 20 MB)
+# 5) 确认没有图片/音频被跟踪
+#    (文本扫描抓不到图片内容 —— 聊天截图、会话标题裁剪图都会漏)
+git ls-files | Select-String -Pattern '\.(png|jpg|jpeg|gif|webp|bmp|wav|mp3)$'
+
+# 6) 确认没有本机用户名路径 / GitHub token / 私钥
+#    路径别写死盘符和用户名(那会让这行命令自己也被扫出来),用字符类代替
+git grep -n -I -E "[A-Za-z]:[\\/]+Users[\\/]+|ghp_[A-Za-z0-9]{20,}|github_pat_|BEGIN [A-Z ]*PRIVATE KEY"
+
+# 7) 确认仓库体积合理(应当 < 20 MB)
 git count-objects -vH
 ```
 
-**如果第 1~4 条有输出 → 停下,先处理,别 push。**
+**如果第 1~6 条有输出 → 停下,先处理,别 push。**
 
 万一已经 push 了:立刻去服务商后台**吊销那个 Key**,
 再考虑用 `git filter-repo` 清理历史(改历史会重写所有 commit)。
