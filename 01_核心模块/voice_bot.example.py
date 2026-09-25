@@ -205,6 +205,21 @@ DEBUG_MODE = False
 SNAPSHOT_DIR = os.path.join(ROOT, "05_文档", "发送截图")
 LOG_DIR = os.path.join(ROOT, "05_文档", "运行日志")
 
+# ---------------------------------------------------------------------------
+# ★ 对话记忆
+#
+# 为什么要自己存:本项目的回复是**语音条**,微信数据库里存的是 XML
+# (不含文字),所以无法从数据库还原"我说过什么"。不在本地记一份,
+# AI 每次就只能看到「人设 + 当前这一句」—— 完全没有上下文。
+#
+# 记忆文件含聊天内容,已加入 .gitignore,不会进仓库。
+# ---------------------------------------------------------------------------
+MEMORY_FILE = os.path.join(ROOT, "voice_bot_memory.json")
+HISTORY_TURNS = 8           # 每次最多带最近几轮(user+assistant 各算一条)
+MEMORY_SEED_FROM_DB = 6     # 首次没有记忆时,取数据库里对方最近 N 条文本做种子
+USER_MSG_WITH_TIME = True   # 给用户消息加时间前缀(人设里要求"以发送时间为准")
+MEMORY_KEEP_TURNS = 40      # 文件里最多保留多少轮(防止无限增长)
+
 
 class _Tee(object):
     """把输出同时写到控制台和日志文件。
@@ -320,6 +335,103 @@ def save_state(st):
             json.dump(st, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print("[警告] 保存状态失败:", e)
+
+
+_MEM = None
+
+
+def get_memory():
+    """读对话记忆(进程内缓存)。"""
+    global _MEM
+    if _MEM is None:
+        _MEM = {}
+        if os.path.isfile(MEMORY_FILE):
+            try:
+                with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                    _MEM = json.load(f) or {}
+                print("[记忆] 已加载 %d 个会话的对话记忆" % len(_MEM))
+            except Exception as e:
+                print("[记忆] 读取失败(按空处理): %s" % str(e)[:60])
+                _MEM = {}
+    return _MEM
+
+
+def save_memory(mem=None):
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(mem if mem is not None else get_memory(), f,
+                      ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("[警告] 保存对话记忆失败:", e)
+
+
+def format_user_msg(text, ts=None):
+    """给用户消息加时间前缀 —— 人设里写了"用户的消息带有消息发送时间"。"""
+    if USER_MSG_WITH_TIME and ts:
+        return "[%s] %s" % (time.strftime("%Y-%m-%d %H:%M",
+                                         time.localtime(int(ts))), text)
+    return text
+
+
+def build_history(chat_key):
+    """把记忆里的 (对方, 我) 转成 OpenAI 的 messages(只取最近若干轮)。"""
+    turns = get_memory().get(chat_key) or []
+    hist = []
+    for t in turns[-HISTORY_TURNS:]:
+        u, a = (t.get("user") or "").strip(), (t.get("assistant") or "").strip()
+        if u:
+            hist.append({"role": "user", "content": format_user_msg(u, t.get("t"))})
+        if a:
+            hist.append({"role": "assistant", "content": a})
+    return hist
+
+
+def remember(chat_key, user_text, reply, ts=None):
+    """把这一轮记进记忆。若最后一条正是本条用户消息(数据库种子),就补上回复。"""
+    mem = get_memory()
+    turns = mem.setdefault(chat_key, [])
+    ts = int(ts or time.time())
+    if (turns and (turns[-1].get("user") or "").strip() == (user_text or "").strip()
+            and not (turns[-1].get("assistant") or "").strip()):
+        turns[-1]["assistant"] = reply
+    else:
+        turns.append({"t": ts, "user": user_text, "assistant": reply})
+    if len(turns) > MEMORY_KEEP_TURNS:
+        del turns[:-MEMORY_KEEP_TURNS]
+    save_memory(mem)
+
+
+def ensure_memory_seeded(db, chat_key, name=None):
+    """首次遇到某会话时,用数据库里对方的最近文本消息打底。
+
+    这样即便还没积累自己的记忆,第一条回复也已经知道对方之前说了什么。
+    种子条目只有 user、没有 assistant(因为我们无法从数据库还原语音内容)。
+    """
+    mem = get_memory()
+    if chat_key in mem:
+        return
+    turns = []
+    if MEMORY_SEED_FROM_DB > 0:
+        try:
+            real = resolve_chat_key(db, chat_key, name)
+            got = []
+            for m in db.get_messages(real, limit=60):
+                if m.get("sender_id") == 1:
+                    continue
+                typ = str(m.get("type") or "")
+                if "文本" not in typ and "text" not in typ.lower():
+                    continue
+                c = str(m.get("content") or "").strip()
+                if c:
+                    got.append((int(m.get("create_time") or 0), c))
+            got.sort()
+            for ct, c in got[-MEMORY_SEED_FROM_DB:]:
+                turns.append({"t": ct, "user": c, "assistant": ""})
+        except Exception as e:
+            print("  [记忆] 种子读取失败(忽略): %s" % str(e)[:60])
+    mem[chat_key] = turns
+    save_memory(mem)
+    print("  [记忆] 首次为该会话建立记忆:种子 %d 条对方消息" % len(turns))
 
 
 def resolve_chat_key(db, key, name=None):
@@ -622,9 +734,22 @@ def run_once(db, state, live):
             print("[%s] 收到: %s" % (name, user_text[:60]))
             print("=" * 70)
 
+            # ★ 对话记忆:首次先打底,然后取出最近若干轮历史
+            ensure_memory_seeded(db, chat_key, name)
+            hist = build_history(chat_key)
+            if hist:
+                print("  [记忆] 带上 %d 条历史(%d 条对方 / %d 条我)"
+                      % (len(hist),
+                         sum(1 for h in hist if h["role"] == "user"),
+                         sum(1 for h in hist if h["role"] == "assistant")))
+            else:
+                print("  [记忆] (暂无历史,这是第一轮)")
+
             # AI 回复
             try:
-                reply = ai_reply(cfg["persona"], user_text)
+                reply = ai_reply(cfg["persona"],
+                                 format_user_msg(user_text, item["time"]),
+                                 history=hist)
             except Exception as e:
                 print("  [AI 失败] %s" % e)
                 continue
@@ -653,6 +778,8 @@ def run_once(db, state, live):
                                    expect_name=name, debug=DEBUG_MODE)
                     if r.get("ok"):
                         print("  ✅ 语音条已发送")
+                        # ★ 记进对话记忆(对方说了什么 / 我回了什么)
+                        remember(chat_key, user_text, reply, item["time"])
                         _sent_counter["n"] += 1
                         maybe_cleanup(_sent_counter["n"])
                     else:
@@ -662,6 +789,7 @@ def run_once(db, state, live):
                         print("           以及 05_文档\\运行日志\\ 里当天的日志")
                 else:
                     print("  [DRY-RUN] 将发送语音: %s" % voice_text)
+                    remember(chat_key, user_text, reply, item["time"])
             except Exception as e:
                 # 未预料的异常:记下来、打印 traceback,但不让整轮崩掉
                 import traceback
