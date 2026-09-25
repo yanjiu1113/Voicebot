@@ -28,6 +28,14 @@ if os.path.join(_HERE, "vendor_py") not in sys.path:
 
 _user32 = ctypes.windll.user32
 _gdi32 = ctypes.windll.gdi32
+# ★ 必须声明原型:windll.gdi32/user32 是**进程内共享对象**,
+#   vendor_py 里的 uiautomation 给 GetWindowDC/CreateCompatibleDC/SelectObject
+#   设过 restype=c_void_p,于是句柄变成完整 64 位;而本模块原先没声明 argtypes,
+#   句柄 >= 2**31 时就会抛
+#       ArgumentError: argument 1: OverflowError: int too long to convert
+#   —— 导致偶发崩溃、截图空白、水位不推进(见 win32_proto.py 顶部说明)。
+import win32_proto
+win32_proto.apply(_user32, _gdi32)
 _user32.SetProcessDPIAware()
 
 # ---------------------------------------------------------------------------

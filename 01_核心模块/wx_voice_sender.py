@@ -279,6 +279,13 @@ def _is_debug(debug=None):
 
 _user32 = ctypes.windll.user32
 _gdi32 = ctypes.windll.gdi32
+# ★ 必须声明原型 —— 否则句柄 >= 2**31 时会抛
+#   "ArgumentError: argument 1: OverflowError: int too long to convert"
+#   (windll.user32/gdi32 是进程内共享对象,vendor_py 的 uiautomation
+#    给 GetWindowDC/CreateCompatibleDC/SelectObject 设过 restype=c_void_p)
+#   详见 win32_proto.py 顶部说明。
+import win32_proto
+win32_proto.apply(_user32, _gdi32)
 _user32.SetProcessDPIAware()
 
 
@@ -769,6 +776,9 @@ def send_voice_by_row(text, row_index, out_dir=None, keep_wav=False,
     except Exception as e:
         # session_guard 不可用时,退回原来的直接点击
         log("       [警告] 会话检测不可用(%s),退回直接点击" % str(e)[:60])
+        import traceback
+        for _ln in traceback.format_exc().rstrip().split("\n")[-6:]:
+            log("         %s" % _ln)
         x, y = session_row_pos(hwnd, row_index)
         ws.click(x, y, expect_hwnd=hwnd)
         time.sleep(1.2)

@@ -25,6 +25,16 @@ from ctypes import wintypes
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
 kernel32 = ctypes.windll.kernel32
+# ★ 必须声明原型 —— 否则句柄 >= 2**31 时点击/截图会抛
+#   "ArgumentError: argument 1: OverflowError: int too long to convert"
+#   (windll.user32/gdi32 是**进程内共享对象**,vendor_py 的 uiautomation
+#    给 GetWindowDC/CreateCompatibleDC/SelectObject 设过 restype=c_void_p。
+#    详见 win32_proto.py 顶部说明)
+try:
+    import win32_proto
+    win32_proto.apply(user32, gdi32, kernel32)
+except Exception:
+    pass
 user32.SetProcessDPIAware()
 
 # 渲染窗口类名前缀(微信 4.1.x)
